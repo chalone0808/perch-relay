@@ -1,0 +1,28 @@
+{
+  "_comment": "Frozen on 2026-11-25 from the app and laptop builds before relay accounts. Replayed by compat.test.ts against every relay build; never edit these to make a test pass.",
+  "pair_request": { "code": "<code>", "name": "iPhone", "pubkey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+  "pair_response_keys": ["kind", "token"],
+  "machine_pair_request": { "code": "<code>", "name": "mac", "pubkey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" },
+  "machine_sync_request": {
+    "after": 0,
+    "outbox": [{ "id": "u1", "type": "agent_reply", "session_id": "s1", "body": { "e2e": 1 }, "notify": true }],
+    "wait": 0,
+    "pubkey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "direct": { "port": 8790, "addrs": [{ "host": "192.168.1.20", "network": "lan" }] }
+  },
+  "machine_sync_response_keys": ["acked", "cursor", "inbox", "phones"],
+  "phone_sync_request": {
+    "after": 0,
+    "outbox": [],
+    "wait": 0,
+    "pubkey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "push_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "push_off": ["task_note"]
+  },
+  "phone_sync_response": {
+    "acked": [],
+    "inbox": [{ "id": "u1", "type": "agent_reply", "session_id": "s1", "body": { "e2e": 1 }, "notify": true, "machine": "mac", "seq": 1 }],
+    "cursor": 1,
+    "machines": [{ "name": "mac", "last_seen": "<iso>", "pubkey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "direct": { "port": 8790, "addrs": [{ "host": "192.168.1.20", "network": "lan" }] } }]
+  }
+}
