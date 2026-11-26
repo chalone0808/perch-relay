@@ -9,6 +9,7 @@
 //   bun server.ts devices                        list devices
 //   bun server.ts revoke <device id>             revoke a device
 //   bun server.ts account <add|list|passwd|bind|disable> ...   relay accounts (accounts.ts)
+//   bun server.ts invite <create|list> ...                     invite-gated sign-up keys (accounts.ts)
 //
 // API (all JSON):
 //   POST /v1/pair  { code, name, pubkey }  → { token, kind }   laptops only; phones sign in (auth.ts)
@@ -26,7 +27,7 @@ import { Database } from 'bun:sqlite'
 import { randomBytes, createHash, createHmac } from 'node:crypto'
 import { isIPv4 } from 'node:net'
 import { makePushSender, type PushSender } from './apns'
-import { accountCli, authSchema, HEAD, sha, sweep } from './accounts'
+import { accountCli, authSchema, HEAD, inviteCli, sha, sweep } from './accounts'
 import { authConfig, authRoutes, clientIp, type AuthConfig, type AuthDeps } from './auth'
 
 type Msg = {
@@ -414,6 +415,13 @@ if (import.meta.main) {
   } else if (cmd === 'account') {
     try {
       console.log(await accountCli(db, process.argv.slice(3)))
+    } catch (e) {
+      console.error((e as Error).message)
+      process.exit(1)
+    }
+  } else if (cmd === 'invite') {
+    try {
+      console.log(inviteCli(db, process.argv.slice(3)))
     } catch (e) {
       console.error((e as Error).message)
       process.exit(1)

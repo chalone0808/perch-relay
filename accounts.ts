@@ -34,7 +34,16 @@ export function authSchema(db: Database) {
     create table if not exists auth_failures (key_hash text primary key, fails integer not null, until integer not null, expires integer not null);
     create table if not exists oauth_states (
       state_hash text primary key, provider text not null, challenge text not null,
-      expires integer not null, used integer not null default 0);`)
+      expires integer not null, used integer not null default 0);
+    create table if not exists invites (
+      token_hash text primary key, expires integer not null, used integer not null default 0,
+      created text not null, claimed_by integer references accounts(id));
+    create table if not exists pending_identities (
+      token_hash text primary key, provider text not null, external_id text not null, subject text not null,
+      challenge text not null, expires integer not null, used integer not null default 0, created text not null);
+    create table if not exists oauth_links (
+      state_hash text primary key, provider text not null, account_id integer not null references accounts(id),
+      expires integer not null, used integer not null default 0, created text not null);`)
   // An operator-set (one-time) password must be replaced before it can register a device; a session
   // from such a login carries the flag.
   for (const table of ['identities', 'sessions']) {
@@ -45,7 +54,7 @@ export function authSchema(db: Database) {
 
 /// Drops expired one-time rows; runs alongside the pairing-code cleanup.
 export function sweep(db: Database, now = Date.now()) {
-  for (const table of ['sessions', 'auth_tokens', 'oauth_states', 'rate_limits', 'auth_failures']) db.run(`delete from ${table} where expires < ?`, [now])
+  for (const table of ['sessions', 'auth_tokens', 'oauth_states', 'invites', 'pending_identities', 'oauth_links', 'rate_limits', 'auth_failures']) db.run(`delete from ${table} where expires < ?`, [now])
 }
 
 export const newToken = (prefix: string, rand: Rand = randomBytes) => prefix + rand(32).toString('base64url')
@@ -97,8 +106,95 @@ export function canonicalName(raw: unknown): string | null {
 }
 
 const lower = (s: string) => s.trim().toLowerCase()
-export type Binding = { email?: string; github?: string; google?: string }
+export type Binding = { email?: string; github?: string; google?: string; apple?: string }
 const iso = () => new Date().toISOString()
+
+export const INVITE_PREFIX = 'pinv_'
+
+/// One-time sign-up keys. Only the SHA-256 of each key is stored; the raw key is returned once.
+export function createInvites(
+  db: Database,
+  opts: { count?: number; ttlMs?: number; now?: number; rand?: Rand } = {},
+): string[] {
+  const count = opts.count ?? 1
+  const ttlMs = opts.ttlMs ?? 7 * 24 * 3600_000
+  const at = opts.now ?? Date.now()
+  const rand = opts.rand ?? randomBytes
+  if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('invite count must be 1-100')
+  if (!Number.isFinite(ttlMs) || ttlMs < 60_000 || ttlMs > 30 * 24 * 3600_000) throw new Error('invite lifetime must be 1-720 hours')
+  const keys: string[] = []
+  for (let i = 0; i < count; i++) {
+    keys.push(insertWithToken(INVITE_PREFIX, (hash) =>
+      db.run('insert into invites (token_hash, expires, used, created) values (?, ?, 0, ?)', [hash, at + ttlMs, new Date(at).toISOString()]), rand))
+  }
+  return keys
+}
+
+/// `bun server.ts invite <create|list> ...`; raw keys are shown only by create, once.
+export function inviteCli(db: Database, args: string[]): string {
+  const [sub, ...rest] = args
+  if (sub === 'create') {
+    let count = 1
+    let ttlHours = 168
+    for (let i = 0; i < rest.length; i++) {
+      const flag = rest[i].replace(/^--/, '')
+      if (flag === 'count' || flag === 'ttl-hours') {
+        if (!rest[i + 1]) throw new Error(`--${flag} needs a value`)
+        const n = Number(rest[++i])
+        if (!Number.isInteger(n)) throw new Error(`--${flag} must be a number`)
+        if (flag === 'count') count = n
+        else ttlHours = n
+      } else throw new Error(`unknown option ${rest[i]}`)
+    }
+    return createInvites(db, { count, ttlMs: ttlHours * 3600_000 }).join('\n')
+  }
+  if (sub === 'list') {
+    return JSON.stringify(db.query(`
+      select i.expires, i.used, i.created, a.name as claimed_by
+      from invites i left join accounts a on a.id = i.claimed_by
+      order by i.created desc`).all(), null, 2)
+  }
+  throw new Error('usage: invite create [--count N] [--ttl-hours H] | invite list')
+}
+
+export class ClaimError extends Error {
+  constructor(readonly status: 400 | 409, message: string) {
+    super(message)
+  }
+}
+
+/// Creates an account at invite claim time and binds the already-verified provider identity.
+/// The caller must run this inside the same transaction that consumes the invite/pending rows.
+export function insertClaimedAccount(
+  db: Database,
+  rawName: string,
+  identity: { provider: string; subject: string; externalId: string },
+): { id: number; name: string; tenant: string } {
+  const name = canonicalName(rawName)
+  if (!name) throw new ClaimError(400, 'that invite key cannot be an account name')
+  const owner = relayTenant(db)
+  const tenant = tenantFor(name, relaySalt(db))
+  if (tenant === owner || db.query('select 1 from accounts where tenant_id = ?').get(tenant))
+    throw new ClaimError(409, 'that invite key cannot create an account')
+  if (db.query('select 1 from devices where tenant_id = ? limit 1').get(tenant))
+    throw new ClaimError(409, 'that invite key cannot create an account')
+  let id: number
+  try {
+    const result = db.run('insert into accounts (name, tenant_id, created) values (?, ?, ?)', [name, tenant, iso()])
+    id = Number(result.lastInsertRowid)
+  } catch (e) {
+    if (String((e as Error)?.message).includes('UNIQUE constraint failed')) throw new ClaimError(409, 'that invite key cannot create an account')
+    throw e
+  }
+  try {
+    db.run('insert into identities (account_id, provider, subject, external_id, created) values (?, ?, ?, ?, ?)',
+      [id, identity.provider, lower(identity.subject), identity.externalId, iso()])
+  } catch (e) {
+    if (String((e as Error)?.message).includes('UNIQUE constraint failed')) throw new ClaimError(409, 'that account is already linked')
+    throw e
+  }
+  return { id, name, tenant }
+}
 
 function accountByName(db: Database, raw: string) {
   const name = canonicalName(raw)
@@ -109,7 +205,7 @@ function accountByName(db: Database, raw: string) {
 
 export function bindIdentity(db: Database, rawName: string, bind: Binding) {
   const account = accountByName(db, rawName)
-  const rows: [string, string | undefined][] = [['email', bind.email], ['oauth:github', bind.github], ['oauth:google', bind.google]]
+  const rows: [string, string | undefined][] = [['email', bind.email], ['oauth:github', bind.github], ['oauth:google', bind.google], ['oauth:apple', bind.apple]]
   db.transaction(() => {
     for (const [provider, subject] of rows) {
       if (!subject?.trim()) continue
@@ -172,13 +268,13 @@ export async function accountCli(db: Database, args: string[]): Promise<string> 
   const flags: Record<string, string | true> = {}
   for (let i = 0; i < rest.length; i++) {
     const flag = rest[i].replace(/^--/, '')
-    if (['email', 'github', 'google'].includes(flag)) {
+    if (['email', 'github', 'google', 'apple'].includes(flag)) {
       if (!rest[i + 1]) throw new Error(`--${flag} needs a value`)
       flags[flag] = rest[++i]
     } else if (['adopt', 'password', 'keep-devices'].includes(flag)) flags[flag] = true
     else throw new Error(`unknown option ${rest[i]}`)
   }
-  const bind = { email: flags.email as string, github: flags.github as string, google: flags.google as string }
+  const bind = { email: flags.email as string, github: flags.github as string, google: flags.google as string, apple: flags.apple as string }
   switch (sub) {
     case 'add': {
       if (!name) break
@@ -199,5 +295,5 @@ export async function accountCli(db: Database, args: string[]): Promise<string> 
       disableAccount(db, name, { keepDevices: !!flags['keep-devices'] })
       return `disabled ${canonicalName(name)}${flags['keep-devices'] ? ' (devices kept)' : ' and revoked its devices'}`
   }
-  throw new Error('usage: account add <name> [--adopt] [--password] [--email a] [--github login] [--google email] | list | passwd <name> | bind <name> [--email|--github|--google ...] | disable <name> [--keep-devices]')
+  throw new Error('usage: account add <name> [--adopt] [--password] [--email a] [--github login] [--google email] [--apple subject] | list | passwd <name> | bind <name> [--email|--github|--google|--apple ...] | disable <name> [--keep-devices]')
 }

@@ -407,7 +407,7 @@ test('the SMTP sender speaks enough SMTP to a local server', async () => {
   expect(seen).toContain('RCPT TO:<a@example.com>')
   expect(seen).toContain('..dot') // dot-stuffed
   server.stop(true)
-  await expect(smtpSender('smtp://mail.example.invalid:1', 'p@x')({ to: 'a@b', subject: '', text: '' })).rejects.toThrow()
+  await expect(smtpSender('smtp://127.0.0.1:1', 'p@x')({ to: 'a@b', subject: '', text: '' })).rejects.toThrow()
 })
 
 const OAUTH_CFG = {
@@ -461,15 +461,19 @@ test('OAuth: a bound GitHub login hands off; the state works once', async () => 
   r.stop()
 })
 
-test('OAuth: unbound identities get the allowlist page, never an account', async () => {
+test('OAuth: unbound identities get a pending invite, never an account', async () => {
   const gh = fakeGithub(() => ({ id: 7, login: 'stranger' }))
   const r = relay(OAUTH_CFG, { fetch: gh.fetchFn })
   await addAccount(r.db, 'alice', { github: 'octo' })
   const { res } = await githubLogin(r)
-  expect(res.status).toBe(403)
-  expect(res.headers.get('content-security-policy')).toContain("default-src 'none'")
-  expect(await res.text()).toContain('allowlist')
+  expect(res.status).toBe(302)
+  const loc = new URL(res.headers.get('location')!)
+  expect(loc.protocol).toBe('perch:')
+  expect(loc.host).toBe('auth')
+  expect(loc.pathname).toBe('/callback')
+  expect(loc.searchParams.get('pending')).toStartWith('ppend_')
   expect(r.db.query('select count(*) as n from accounts').get()).toEqual({ n: 1 })
+  expect(r.db.query('select count(*) as n from pending_identities').get()).toEqual({ n: 1 })
   r.stop()
 })
 
@@ -483,8 +487,10 @@ test('OAuth: the immutable id wins over later login renames and reclaims', async
   const renamed = await githubLogin(r)
   expect(renamed.res.status).toBe(302)
 
-  user = { id: 99, login: 'octo' } // someone reclaimed the old login
-  expect((await githubLogin(r)).res.status).toBe(403)
+  user = { id: 99, login: 'octo' } // someone reclaimed the old login: pending, not alice
+  const reclaimed = await githubLogin(r)
+  expect(reclaimed.res.status).toBe(302)
+  expect(new URL(reclaimed.res.headers.get('location')!).searchParams.get('pending')).toStartWith('ppend_')
 
   await addAccount(r.db, 'bob', { github: 'octo' }) // the operator may bind the reclaimed login anew
   const bob = await githubLogin(r)
@@ -521,7 +527,7 @@ test('Google ID tokens are checked for signature, issuer, audience and expiry', 
     return `${h}.${p}.${sign('RSA-SHA256', Buffer.from(`${h}.${p}`), key).toString('base64url')}`
   }
   const good = { iss: 'https://accounts.google.com', aud: 'g-id', exp: now / 1000 + 600, sub: '1234', email: 'A@Gmail.com', email_verified: true }
-  expect(verifyGoogleIdToken(token(good), 'g-id', [jwk], now)).toEqual({ externalId: '1234', subject: 'a@example.com' })
+  expect(verifyGoogleIdToken(token(good), 'g-id', [jwk], now)).toEqual({ externalId: '1234', subject: 'a@gmail.com' })
   expect(() => verifyGoogleIdToken(token({ ...good, iss: 'https://evil.example' }), 'g-id', [jwk], now)).toThrow(/issuer/)
   expect(() => verifyGoogleIdToken(token({ ...good, aud: 'other' }), 'g-id', [jwk], now)).toThrow(/audience/)
   expect(() => verifyGoogleIdToken(token({ ...good, exp: now / 1000 - 1 }), 'g-id', [jwk], now)).toThrow(/expired/)
@@ -537,7 +543,7 @@ test('Google ID tokens are checked for signature, issuer, audience and expiry', 
     return new Response('', { status: 404 })
   }) as typeof fetch
   const r = relay(OAUTH_CFG, { fetch: fetchFn })
-  await addAccount(r.db, 'alice', { google: 'a@example.com' })
+  await addAccount(r.db, 'alice', { google: 'a@gmail.com' })
   const start = await r.call('GET', `/v1/auth/oauth/google/start?challenge=${challenge}`)
   const state = new URL(start.headers.get('location')!).searchParams.get('state')!
   const res = await r.call('GET', `/v1/auth/oauth/google/callback?code=c&state=${encodeURIComponent(state)}`)

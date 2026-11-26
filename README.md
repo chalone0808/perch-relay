@@ -126,6 +126,24 @@ api.example.com {
 `X-Real-IP` is required: sign-in rate limits are per client address, and the
 relay trusts that header only from a loopback peer.
 
+### Invite new accounts
+
+New users sign in with GitHub, Google or Apple and then redeem a one-time invite
+key. The key creates the account and becomes its initial username; the app
+offers a skippable rename right after. Keys look like `pinv_…` and are shown
+once:
+
+```sh
+perch-relay invite create --count 3 --ttl-hours 168
+```
+
+`--count` is 1–100 and `--ttl-hours` 1–720 (seven days by default). Only a
+SHA-256 hash is stored, and each key works once. `perch-relay invite list` shows
+expiry, whether a key was used, and which account claimed it, never the key.
+There is no account or username to choose before the user claims a key.
+
+An account can also be created and bound by the operator, without an invite:
+
 ### Create an account
 
 Phones sign in; they do not use pairing codes. With an installer deployment:
@@ -154,11 +172,32 @@ Other account commands:
 
 ```sh
 perch-relay account list
-perch-relay account bind <name> [--email <addr>] [--github <login>] [--google <email>]
+perch-relay account bind <name> [--email <addr>] [--github <login>] [--google <email>] [--apple <subject>]
 perch-relay account disable <name> [--keep-devices]
 ```
 
 Limits are 10 phones and 20 laptops per account.
+
+### How accounts and sign-in fit together
+
+An account's identity is its `accounts.id`, its unique `tenant_id`, and each
+bound provider identity (`provider` plus the provider's immutable external id:
+GitHub's numeric id, Google's `sub`, Apple's `sub`). The username is a mutable
+unique handle: changing it keeps the account, tenant, devices, history and
+linked providers. An invite key is a one-time claim credential, never a
+permanent identifier or password.
+
+- The first sign-in with an unknown provider identity returns a 10-minute
+  pending identity instead of an account. The app asks for an invite key and
+  `POST /v1/auth/claim` creates the account, tenant, bound identity and session
+  atomically. A bad or already-used key consumes nothing, so the user can retry.
+- Operator pre-bound identities still sign in directly. Existing password
+  accounts are untouched.
+- Settings → Sign-In Methods can link or unlink GitHub, Google, Apple, and
+  unlink a linked email. The last remaining method cannot be removed. Native
+  Apple needs no web redirect.
+- Settings → Change Username renames the account; password sign-in uses the
+  new name immediately.
 
 ### Pair a laptop
 
@@ -232,9 +271,15 @@ sudo loginctl enable-linger "$USER"   # if your system requires it
 | `AUTH_EMAIL` | `1` enables email magic links. Needs `SMTP_URL` and `AUTH_EMAIL_FROM`. |
 | `SMTP_URL` | `smtps://user:pass@host:465`, or `smtp://…:587` with STARTTLS. |
 | `AUTH_EMAIL_FROM` | Sender, e.g. `Perch <perch@example.com>`. |
-| `AUTH_OAUTH` | `github`, `google`, or both. |
-| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | GitHub OAuth app; callback `/v1/auth/oauth/github/callback`. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client; callback `/v1/auth/oauth/google/callback`. |
+| `AUTH_OAUTH` | Comma-separated `github`, `google`, `apple`. Each also needs its credentials below and an https `PERCH_PUBLIC_URL`. |
+| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | GitHub OAuth app; callback `https://your-relay/v1/auth/oauth/github/callback`. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client; callback `https://your-relay/v1/auth/oauth/google/callback`. |
+| `APPLE_CLIENT_ID` | The iOS app's bundle id (`com.chalone.perch`). Apple is verified natively from its identity token; no Services ID or client secret is used. Enable the Sign in with Apple capability on the App ID and rebuild the app. |
+
+Google OAuth clients must be type **Web application** (not iOS), with
+`${PERCH_PUBLIC_URL}/v1/auth/oauth/google/callback` as an authorized redirect URI. The relay does
+the code exchange with the secret, so the ID and secret stay in `relay.env` and each relay needs
+its own client.
 | `PUSH_GATEWAY`, `PUSH_GATEWAY_KEY` | Send push through a gateway (below). |
 | `APNS_KEY_FILE`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENV` | Push directly to Apple when no gateway is configured. |
 
