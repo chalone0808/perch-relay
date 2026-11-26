@@ -12,9 +12,7 @@ envelopes it cannot read.
 This repository contains the relay server. The laptop client is in the
 `chalone0808/perch` repository. The iOS app is not in this repository.
 
-```
-server/   relay, push gateway, and tests
-```
+The relay code is at the repository root; its tests are in `test/`.
 
 The relay needs [Bun](https://bun.sh).
 
@@ -70,7 +68,7 @@ mkdir -p ~/perch-data
 PERCH_DB="$HOME/perch-data/perch.db" \
 PERCH_PUBLIC_URL="https://api.example.com" \
 PORT=8787 HOST=127.0.0.1 \
-bun server/server.ts
+bun server.ts
 ```
 
 The relay binds loopback by default. Put a TLS proxy in front; a Caddy site is:
@@ -92,7 +90,7 @@ relay trusts that header only from a loopback peer.
 Phones sign in; they do not use pairing codes.
 
 ```sh
-PERCH_DB="$HOME/perch-data/perch.db" bun server/server.ts account add alice --adopt --password
+PERCH_DB="$HOME/perch-data/perch.db" bun server.ts account add alice --adopt --password
 ```
 
 `--adopt` binds the relay's existing tenant to this first account. Use it for
@@ -100,7 +98,7 @@ the owner account so CLI-issued laptop codes belong to the same tenant.
 Additional accounts use a new tenant:
 
 ```sh
-PERCH_DB="$HOME/perch-data/perch.db" bun server/server.ts account add bob --password
+PERCH_DB="$HOME/perch-data/perch.db" bun server.ts account add bob --password
 ```
 
 Each command prints a 16-character one-time password once. The app asks the
@@ -109,10 +107,10 @@ user to choose their own password at first sign-in.
 Other account commands:
 
 ```sh
-bun server/server.ts account list
-bun server/server.ts account passwd <name>
-bun server/server.ts account bind <name> [--email <addr>] [--github <login>] [--google <email>]
-bun server/server.ts account disable <name> [--keep-devices]
+bun server.ts account list
+bun server.ts account passwd <name>
+bun server.ts account bind <name> [--email <addr>] [--github <login>] [--google <email>]
+bun server.ts account disable <name> [--keep-devices]
 ```
 
 Limits are 10 phones and 20 laptops per account.
@@ -123,11 +121,11 @@ A laptop pairs with a single-use code, valid for 10 minutes:
 
 - On a signed-in phone: **Settings → Add a Laptop**, then run the command it
   shows on the laptop.
-- Or on the relay: `bun server/server.ts pair machine` for the relay's own
-  tenant, or `bun server/server.ts pair machine <account>` for another account.
+- Or on the relay: `bun server.ts pair machine` for the relay's own
+  tenant, or `bun server.ts pair machine <account>` for another account.
 
-Codes are tenant-scoped. `bun server/server.ts devices` lists everything paired;
-`bun server/server.ts revoke <id>` revokes one device.
+Codes are tenant-scoped. `bun server.ts devices` lists everything paired;
+`bun server.ts revoke <id>` revokes one device.
 
 ### Run as a service
 
@@ -144,7 +142,7 @@ Wants=network-online.target
 User=perch
 WorkingDirectory=/home/perch/perch
 EnvironmentFile=/home/perch/perch-data/relay.env
-ExecStart=/home/perch/.bun/bin/bun server/server.ts
+ExecStart=/home/perch/.bun/bin/bun server.ts
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
@@ -200,7 +198,7 @@ PUSH_GATEWAY=https://push.example.com
 PUSH_GATEWAY_KEY=<secret issued by the gateway operator>
 ```
 
-A gateway runs `server/gateway.ts` and holds the APNs key:
+A gateway runs `gateway.ts` and holds the APNs key:
 
 ```ini
 PORT=8788
@@ -232,13 +230,13 @@ run automatically.
   are encrypted; the relay sees routing metadata only.
 - Never expose the relay without TLS. Keep the database and env files at mode
   0600, run as an unprivileged user, and set `X-Real-IP` at the proxy.
-- Revoke a lost device with `bun server/server.ts revoke <id>`. Disabling an
+- Revoke a lost device with `bun server.ts revoke <id>`. Disabling an
   account also revokes its devices unless `--keep-devices` is passed.
 
 ## Tests
 
 ```sh
-cd server && bun test test/
+bun test test/
 ```
 
 ## License

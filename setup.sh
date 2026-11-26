@@ -248,7 +248,7 @@ fetch_code() { # fetch_code DEST
     (cd "$SOURCE" && tar --exclude=.git -cf - .) | (cd "$dest" && tar -xf -)
     return
   fi
-  if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/server/server.ts" ]; then
+  if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/server.ts" ]; then
     (cd "$SELF_DIR" && tar --exclude=.git -cf - .) | (cd "$dest" && tar -xf -)
     return
   fi
@@ -258,7 +258,7 @@ fetch_code() { # fetch_code DEST
 
 have() { command -v "$1" >/dev/null 2>&1; }
 pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
-local_source() { [ -n "$SOURCE" ] || { [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/server/server.ts" ]; }; }
+local_source() { [ -n "$SOURCE" ] || { [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/server.ts" ]; }; }
 
 shell_rc() { # sets RC_FILE and SHELL_NAME for the invoking user
   local home="${HOME:-}" shellpath="${SHELL:-/bin/sh}" entry=""
@@ -398,9 +398,9 @@ setup_server() {
     esac
   fi
   if [ -n "$SOURCE" ]; then
-    [ -f "$SOURCE/server/server.ts" ] || die "source has no server/: $SOURCE"
-  elif [ -n "$SELF_DIR" ] && [ ! -f "$SELF_DIR/server/server.ts" ]; then
-    die "this checkout has no server/ (use the server repository)"
+    [ -f "$SOURCE/server.ts" ] || die "source has no server.ts: $SOURCE"
+  elif [ -n "$SELF_DIR" ] && [ ! -f "$SELF_DIR/server.ts" ]; then
+    die "this checkout has no server.ts (use the server repository)"
   fi
 
   BUN_DIR="$PREFIX/bun"
@@ -485,7 +485,7 @@ setup_server() {
   local release="$PREFIX/releases/$RELEASE" stage
   stage="$(mktemp -d)"
   fetch_code "$stage/src"
-  [ -f "$stage/src/server/server.ts" ] || die "this checkout has no server/ (use the server repository)"
+  [ -f "$stage/src/server.ts" ] || die "this checkout has no server.ts (use the server repository)"
   as_install rm -rf -- "$release"
   if [ "$INSTALL_MODE" = user ]; then
     as_install install -d -m 0755 "$release"
@@ -582,7 +582,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$PREFIX/current/server
+WorkingDirectory=$PREFIX/current
 EnvironmentFile=$CONFIG_DIR/relay.env
 ExecStart=$BUN server.ts
 Restart=always
@@ -609,7 +609,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
-WorkingDirectory=$PREFIX/current/server
+WorkingDirectory=$PREFIX/current
 EnvironmentFile=$CONFIG_DIR/relay.env
 ExecStart=$BUN server.ts
 Restart=always
@@ -650,7 +650,7 @@ EOF
 set -e
 db=\$(sed -n 's/^PERCH_DB=//p' "$CONFIG_DIR/relay.env" | head -n 1)
 [ -n "\$db" ] || { echo "no PERCH_DB in $CONFIG_DIR/relay.env" >&2; exit 1; }
-cd "$PREFIX/current/server"
+cd "$PREFIX/current"
 exec env PERCH_DB="\$db" "$BUN" server.ts "\$@"
 EOF
     install -m 0755 "$wrapper" "$relay_cmd"
@@ -663,7 +663,7 @@ export PATH
 [ "\$(id -u)" -eq 0 ] || exec sudo "\$0" "\$@"
 db=\$(sed -n 's/^PERCH_DB=//p' "$CONFIG_DIR/relay.env" | head -n 1)
 [ -n "\$db" ] || { echo "no PERCH_DB in $CONFIG_DIR/relay.env" >&2; exit 1; }
-cd "$PREFIX/current/server"
+cd "$PREFIX/current"
 exec runuser -u $SERVICE_USER -- env PERCH_DB="\$db" "$BUN" server.ts "\$@"
 EOF
     as_root install -m 0755 "$wrapper" "$relay_cmd"
@@ -716,7 +716,7 @@ EOF
 
   relay_cli() { # relay_cli ARGS...
     as_service sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh \
-      "$PREFIX/current/server" env PERCH_DB="$DATA_DIR/perch.db" "$BUN" server.ts "$@"
+      "$PREFIX/current" env PERCH_DB="$DATA_DIR/perch.db" "$BUN" server.ts "$@"
   }
 
   say "Account"
