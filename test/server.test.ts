@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { open, pairCode, app, relayTenant, tenantFor, legacyTenantFor } from '../server'
+import { open, pairCode, app, relayTenant, tenantFor, legacyTenantFor, VERSION, PROTOCOL } from '../server'
 import type { PushSender } from '../apns'
 import { HEAD } from '../accounts'
 
@@ -28,6 +28,34 @@ const setup = (push?: PushSender) => {
   const sync = async (token: string, body: any) => (await (await post('/v1/sync', body, token)).json()) as any
   return { db, server, post, pair, sync }
 }
+
+test('reports its version without auth', async () => {
+  const { server } = setup()
+  const url = `http://localhost:${server.port}`
+  const res = await fetch(`${url}/v1/version`)
+  expect(res.status).toBe(200)
+  expect(await res.json()).toEqual({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL })
+  expect((await fetch(`${url}/v1/version`, { method: 'POST' })).status).toBe(405)
+  server.stop(true)
+})
+
+test('laptops report version and protocol to their phones', async () => {
+  const { server, pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  await pair('machine', 'old')
+  await sync(mac, { after: 0, version: '0.2.0', protocol: 1 })
+  const phone = await pair('phone', 'iphone')
+  let r = await sync(phone, { after: 0 })
+  expect(r.machines.find((m: any) => m.name === 'mac')).toMatchObject({ version: '0.2.0', protocol: 1 })
+  // A machine that never reported them stays exactly as before: no version fields at all.
+  expect(r.machines.find((m: any) => m.name === 'old').version).toBeUndefined()
+  expect(r.machines.find((m: any) => m.name === 'old').protocol).toBeUndefined()
+  // Malformed or missing values keep the last good report.
+  await sync(mac, { after: 0, version: 'x'.repeat(33), protocol: 'nope' })
+  r = await sync(phone, { after: 0 })
+  expect(r.machines.find((m: any) => m.name === 'mac')).toMatchObject({ version: '0.2.0', protocol: 1 })
+  server.stop(true)
+})
 
 test('the relay tenant comes from its owner and a per-relay salt', () => {
   const db = open(':memory:', { owner: 'Owner@Example.com', salt: SALT })

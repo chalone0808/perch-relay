@@ -12,6 +12,7 @@
 //   bun server.ts invite <create|list> ...                     invite-gated sign-up keys (accounts.ts)
 //
 // API (all JSON):
+//   GET  /v1/version                       → { name, version, protocol }   public; no auth
 //   POST /v1/pair  { code, name, pubkey }  → { token, kind }   laptops only; phones sign in (auth.ts)
 //   POST /v1/sync  Authorization: Bearer <token>
 //     body { after, outbox: Msg[], wait, pubkey }  → { acked, inbox: Msg[], cursor, machines? | phones? }
@@ -29,6 +30,11 @@ import { isIPv4 } from 'node:net'
 import { makePushSender, type PushSender } from './apns'
 import { accountCli, authSchema, HEAD, inviteCli, sha, sweep } from './accounts'
 import { authConfig, authRoutes, clientIp, type AuthConfig, type AuthDeps } from './auth'
+
+// The relay's release version and wire protocol. Bump VERSION for every release; bump PROTOCOL
+// only when a phone or laptop built for the previous protocol can no longer talk to this relay.
+export const VERSION = '0.2.0'
+export const PROTOCOL = 1
 
 type Msg = {
   id: string; type: string; session_id?: string | null; machine?: string; body?: unknown; ts?: string
@@ -129,6 +135,9 @@ export function open(path: string, opts: { owner?: string; salt?: string } = {})
   }
   // The newest end-to-end format the device reads (client/e2e.ts); senders pick per recipient.
   if (!db.query(`select 1 from pragma_table_info('devices') where name = 'e2e'`).get()) db.exec('alter table devices add column e2e integer not null default 1')
+  // A laptop's reported client version and wire protocol, so phones can show it and flag old ones.
+  if (!db.query(`select 1 from pragma_table_info('devices') where name = 'version'`).get()) db.exec('alter table devices add column version text')
+  if (!db.query(`select 1 from pragma_table_info('devices') where name = 'protocol'`).get()) db.exec('alter table devices add column protocol integer')
   if (!db.query(`select 1 from pragma_table_info('messages') where name = 'created'`).get()) {
     db.exec('alter table messages add column created integer')
     db.run('update messages set created = ?', [Date.now()])
@@ -291,6 +300,10 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
       const path = new URL(req.url).pathname
       if (path.startsWith('/v1/auth/') || path === '/v1/devices' || path === '/v1/devices/link' || path === '/v1/pair/machine' || path === '/v1/unpair')
         return authHandler(req, clientIp(server?.requestIP(req)?.address, req.headers.get('x-real-ip')))
+      if (path === '/v1/version') {
+        if (req.method !== 'GET') return bad(405, 'GET only')
+        return Response.json({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL })
+      }
       if (req.method !== 'POST') return bad(405, 'POST only')
       let body: any
       try { body = await req.json() } catch { return bad(400, 'bad json') }
@@ -331,6 +344,14 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
           if (off !== dev.push_off) db.run('update devices set push_off = ? where id = ?', [off, dev.id])
         }
         if ((body.e2e === 1 || body.e2e === 2) && body.e2e !== dev.e2e) db.run('update devices set e2e = ? where id = ?', [body.e2e, dev.id])
+        // A laptop's version is informational; its protocol is what the app compares. Keep the last
+        // valid values when an older client omits them or sends something malformed.
+        if (dev.kind === 'machine') {
+          const version = typeof body.version === 'string' && /^[0-9A-Za-z._+-]{1,32}$/.test(body.version) ? body.version : null
+          if (version !== null && version !== dev.version) db.run('update devices set version = ? where id = ?', [version, dev.id])
+          const protocol = Number.isInteger(body.protocol) && body.protocol >= 0 && body.protocol <= 1_000_000 ? body.protocol : null
+          if (protocol !== null && protocol !== dev.protocol) db.run('update devices set protocol = ? where id = ?', [protocol, dev.id])
+        }
         if (dev.kind === 'machine' && body.direct !== undefined) {
           const hint = body.direct === null ? null : directHint(body.direct)
           const json = hint ? JSON.stringify(hint) : null
@@ -385,12 +406,17 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
         // `e2e` appears only for devices that read the newer format, so older peers see no change.
         const format = ({ e2e, ...d }: any) => (e2e >= 2 ? { ...d, e2e } : d)
         if (dev.kind === 'phone') {
-          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e from devices where kind = 'machine' and not revoked and tenant_id = ?`).all(tenant) as any[])
+          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e, version, protocol from devices where kind = 'machine' and not revoked and tenant_id = ?`).all(tenant) as any[])
             .map((m) => {
               // A corrupt stored hint must not break every phone sync; show it as none.
               let direct = null
               try { direct = m.direct ? JSON.parse(m.direct) : null } catch {}
-              return format({ ...m, direct })
+              // Version fields appear only once the laptop reported them, so older peers and
+              // frozen compatibility fixtures see the same payload as before.
+              const out: any = format({ ...m, direct })
+              if (m.version == null) delete out.version
+              if (m.protocol == null) delete out.protocol
+              return out
             })
         }
         else res.phones = (db.query(`select name, pubkey, e2e from devices where kind = 'phone' and not revoked and tenant_id = ?`).all(tenant) as any[]).map(format)
@@ -411,7 +437,7 @@ if (import.meta.main) {
   } else if (cmd === 'tenant') {
     console.log(relayTenant(db))
   } else if (cmd === 'devices') {
-    console.table(db.query('select id, kind, name, tenant_id, last_seen, revoked, pubkey is not null as encrypted from devices').all())
+    console.table(db.query('select id, kind, name, tenant_id, last_seen, version, protocol, revoked, pubkey is not null as encrypted from devices').all())
   } else if (cmd === 'account') {
     try {
       console.log(await accountCli(db, process.argv.slice(3)))

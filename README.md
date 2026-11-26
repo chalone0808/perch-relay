@@ -304,6 +304,21 @@ perch relay on http://127.0.0.1:8787/, sign-in: password
 
 `GET /v1/auth/methods` reports the same thing.
 
+### Versions
+
+`GET /v1/version` is public and needs no auth:
+
+```json
+{ "name": "perch-relay", "version": "0.2.0", "protocol": 1 }
+```
+
+`version` is the release; `protocol` is the wire contract. A phone or laptop
+built for a higher protocol than the relay reports can warn that the relay needs
+updating. Laptops also send their own `version` and `protocol` in `/v1/sync`;
+the relay stores the last valid values and returns them with each machine in the
+phone's sync response, so the app can flag a computer that needs `perch update`.
+Older clients that send neither keep working and simply have no version shown.
+
 ## Push (optional, advanced)
 
 Push is only a notification hint. Messages remain in the mailbox and sync
@@ -378,6 +393,9 @@ For a manual checkout, `git pull` and restart:
 ```sh
 systemctl --user restart perch-relay
 ```
+
+This updates the relay only. Each laptop's client is a separate install and
+updates there with `perch update` (or by rerunning the client installer).
 
 If you are migrating an old system install (`/opt/perchserver`, a system
 `perch-relay.service`), stop and disable the system unit, copy the database and
