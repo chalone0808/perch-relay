@@ -280,6 +280,19 @@ Google OAuth clients must be type **Web application** (not iOS), with
 `${PERCH_PUBLIC_URL}/v1/auth/oauth/google/callback` as an authorized redirect URI. The relay does
 the code exchange with the secret, so the ID and secret stay in `relay.env` and each relay needs
 its own client.
+
+If the client files are already on the relay host, `apply-oauth.sh` can read them without printing
+their values, write a mode-0600 `oauth.env`, add it to the user unit, enable GitHub/Google, update
+the code, restart, and roll back on failure:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chalone0808/perch-relay/main/apply-oauth.sh -o apply-oauth.sh
+bash apply-oauth.sh --prefix ~/services/perch/perch-server --dry-run
+bash apply-oauth.sh --prefix ~/services/perch/perch-server
+```
+
+Run it as the relay's user. It expects the client files under `<prefix>/oauth`; see
+`bash apply-oauth.sh --help` for the layout, alternate commits, and `--skip-code` / `--skip-oauth`.
 | `PUSH_GATEWAY`, `PUSH_GATEWAY_KEY` | Send push through a gateway (below). |
 | `APNS_KEY_FILE`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC`, `APNS_ENV` | Push directly to Apple when no gateway is configured. |
 
