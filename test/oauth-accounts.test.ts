@@ -177,7 +177,7 @@ test('Settings account info, GitHub link, guarded unlink and rename', async () =
   const phone = ((await (await r.register(await r.session('alice', pw))).json()) as any).token as string
 
   let info = (await (await r.call('GET', '/v1/auth/account', undefined, phone)).json()) as any
-  expect(info).toEqual({ name: 'alice', providers: ['password'] })
+  expect(info).toEqual({ id: r.db.query(`select id from accounts where name = 'alice'`).get()!.id, name: 'alice', providers: ['password'] })
 
   const start = await r.post('/v1/auth/account/link/start', { provider: 'github' }, phone)
   expect(start.status).toBe(200)

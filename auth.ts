@@ -344,7 +344,11 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     if (row instanceof Response) return row
     // A one-time password signs in, but its session can't register a device until it's replaced.
     const mustChange = !!row.must_change
-    return json(200, { session: createSession(row.id, mustChange), ...(mustChange ? { must_change_password: true } : {}) })
+    return json(200, {
+      session: createSession(row.id, mustChange),
+      account_id: row.id,
+      ...(mustChange ? { must_change_password: true } : {}),
+    })
   }
 
   /// Replaces a password, proven by the current one; works for a first sign-in and from Settings
@@ -362,7 +366,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
       db.run(`update identities set secret_hash = ?, must_change = 0 where account_id = ? and provider = 'password'`, [hash, row.id])
       db.run('delete from sessions where account_id = ?', [row.id])
     })()
-    return json(200, { session: createSession(row.id) })
+    return json(200, { session: createSession(row.id), account_id: row.id })
   }
 
   async function exchange(req: Request, ip: string) {
@@ -379,7 +383,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     if (!row || !sameString(challengeOf(verifier), row.challenge)) return denied()
     if (!db.run('update auth_tokens set used = 1 where token_hash = ? and used = 0', [sha(code)]).changes) return denied()
     if (!db.query('select 1 from accounts where id = ? and disabled = 0').get(row.account_id)) return denied()
-    return json(200, { session: createSession(row.account_id) })
+    return json(200, { session: createSession(row.account_id), account_id: row.account_id })
   }
 
   /// Phones paired with a relay code before sign-in hold an unprefixed token. Signing in proves the
@@ -397,7 +401,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     // Unknown, revoked, a laptop, or another tenant's device: one answer for all of them.
     if (!dev || dev.kind !== 'phone' || dev.tenant_id !== account.tenant_id) return bad(403, 'this phone is not in your account')
     const token = insertWithToken('pdev_', (hash) => db.run('update devices set token_hash = ? where id = ?', [hash, dev.id]), rand)
-    return json(200, { token })
+    return json(200, { token, account_id: account.id })
   }
 
   async function registerDevice(req: Request) {
@@ -416,7 +420,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     const token = insertWithToken('pdev_', (hash) =>
       db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id, acked, served) values ('phone', ?, ?, ?, ?, (${HEAD}), (${HEAD}))`, [name, hash, key, account.tenant_id]), rand)
     deps.wake?.(account.tenant_id)
-    return json(200, { token, kind: 'phone' })
+    return json(200, { token, kind: 'phone', account_id: account.id })
   }
 
   /// The account an email address may sign in to: bound, and enabled.
@@ -556,6 +560,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
       return bad(409, 'that account is already linked')
     let session = ''
     let claimedName = ''
+    let claimedId = 0
     try {
       db.transaction(() => {
         if (!db.run('update invites set used = 1 where token_hash = ? and used = 0 and expires > ?', [sha(invite), now()]).changes)
@@ -568,6 +573,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
           externalId: pendingRow.external_id,
         })
         claimedName = account.name
+        claimedId = account.id
         db.run('update invites set claimed_by = ? where token_hash = ?', [account.id, sha(invite)])
         session = createSession(account.id)
       })()
@@ -575,7 +581,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
       if (e instanceof ClaimError) return bad(e.status, e.message)
       return bad(403, 'invalid or expired invite key')
     }
-    return json(200, { session, name: claimedName })
+    return json(200, { session, name: claimedName, account_id: claimedId })
   }
 
   /// Native Sign in with Apple. A bound identity gets a session; an unbound one gets a pending
@@ -599,10 +605,10 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     const existing = identityByExternalId('oauth:apple', who.externalId)
     if (existing) {
       if (existing.disabled) return bad(403, 'account disabled')
-      return json(200, { session: createSession(existing.account_id), name: accountName(existing.account_id) })
+      return json(200, { session: createSession(existing.account_id), account_id: existing.account_id, name: accountName(existing.account_id) })
     }
     const bound = oauthAccount('apple', who)
-    if (bound) return json(200, { session: createSession(bound), name: accountName(bound) })
+    if (bound) return json(200, { session: createSession(bound), account_id: bound, name: accountName(bound) })
     const pending = createPending('apple', who, challenge)
     return json(200, { pending, expires: now() + PENDING_MS })
   }
@@ -610,7 +616,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
   function accountInfo(req: Request) {
     const account = accountGate(req)
     if (account instanceof Response) return account
-    return json(200, { name: account.name, providers: providersFor(account.id) })
+    return json(200, { id: account.id, name: account.name, providers: providersFor(account.id) })
   }
 
   async function linkStart(req: Request) {

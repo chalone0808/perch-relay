@@ -684,3 +684,32 @@ test('linking refuses other tenants, machines, bad sessions and one-time passwor
   expect((await r.post('/v1/devices/link', { token: old }, fresh)).status).toBe(200)
   r.stop()
 })
+
+test('successful auth and device responses include the stable account id', async () => {
+  const r = relay()
+  const pw = await withPassword(r, 'alice')
+  const login = (await (await r.login('alice', pw)).json()) as any
+  expect(login.account_id).toBe(r.db.query(`select id from accounts where name = 'alice'`).get()!.id)
+  const accountId = login.account_id
+
+  const reg = (await (await r.register(login.session)).json()) as any
+  expect(reg.account_id).toBe(accountId)
+
+  const info = (await (await r.call('GET', '/v1/auth/account', undefined, reg.token)).json()) as any
+  expect(info).toMatchObject({ id: accountId, name: 'alice' })
+
+  const renamed = await r.post('/v1/auth/account/rename', { name: 'alice-renamed' }, reg.token)
+  expect(renamed.status).toBe(200)
+  const after = (await (await r.call('GET', '/v1/auth/account', undefined, reg.token)).json()) as any
+  expect(after.id).toBe(accountId)
+  r.stop()
+})
+
+test('a one-time password response still proves the account id', async () => {
+  const r = relay()
+  const pw = (await addAccount(r.db, 'newbie', { password: true })).password!
+  const login = (await (await r.login('newbie', pw)).json()) as any
+  expect(login.account_id).toBe(r.db.query(`select id from accounts where name = 'newbie'`).get()!.id)
+  expect(login.must_change_password).toBe(true)
+  r.stop()
+})
