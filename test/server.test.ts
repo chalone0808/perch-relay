@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { open, pairCode, app, relayTenant, tenantFor, legacyTenantFor, VERSION, PROTOCOL } from '../server'
+import { open, pairCode, app, relayTenant, tenantFor, legacyTenantFor, relayId, VERSION, PROTOCOL } from '../server'
 import type { PushSender } from '../apns'
 import { HEAD } from '../accounts'
 
@@ -29,14 +29,30 @@ const setup = (push?: PushSender) => {
   return { db, server, post, pair, sync }
 }
 
-test('reports its version without auth', async () => {
-  const { server } = setup()
+test('reports its version and a stable relay id without auth', async () => {
+  const { db, server } = setup()
   const url = `http://localhost:${server.port}`
   const res = await fetch(`${url}/v1/version`)
   expect(res.status).toBe(200)
-  expect(await res.json()).toEqual({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL })
+  const body = (await res.json()) as any
+  expect(body).toMatchObject({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL })
+  expect(body.id).toBe(relayId(db))
+  expect(body.id).toMatch(/^[0-9a-f]{32}$/)
   expect((await fetch(`${url}/v1/version`, { method: 'POST' })).status).toBe(405)
   server.stop(true)
+})
+
+test('the relay id is stable across reopen and differs with a different salt', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'perch-relay-id-')), 'relay.db')
+  const a = open(path, { owner: 'relay@test', salt: SALT })
+  const first = relayId(a)
+  a.close()
+  const b = open(path, { owner: 'relay@test', salt: SALT })
+  expect(relayId(b)).toBe(first)
+  b.close()
+  const c = open(':memory:', { owner: 'relay@test', salt: 'other-salt' })
+  expect(relayId(c)).not.toBe(first)
+  c.close()
 })
 
 test('laptops report version and protocol to their phones', async () => {

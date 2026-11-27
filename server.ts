@@ -12,7 +12,7 @@
 //   bun server.ts invite <create|list> ...                     invite-gated sign-up keys (accounts.ts)
 //
 // API (all JSON):
-//   GET  /v1/version                       → { name, version, protocol }   public; no auth
+//   GET  /v1/version                       → { name, version, protocol, id }   public; no auth
 //   POST /v1/pair  { code, name, pubkey }  → { token, kind }   laptops only; phones sign in (auth.ts)
 //   POST /v1/sync  Authorization: Bearer <token>
 //     body { after, outbox: Msg[], wait, pubkey }  → { acked, inbox: Msg[], cursor, machines? | phones? }
@@ -25,7 +25,7 @@
 // APNs notifications carry message metadata only; the relay never sees the encrypted body.
 // Pushes go to Apple directly (APNS_* env) or through a push gateway (PUSH_GATEWAY, gateway.ts).
 import { Database } from 'bun:sqlite'
-import { randomBytes, createHash, createHmac } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { isIPv4 } from 'node:net'
 import { makePushSender, type PushSender } from './apns'
 import { accountCli, authSchema, HEAD, inviteCli, sha, sweep } from './accounts'
@@ -102,6 +102,12 @@ export function relaySalt(db: Database): string {
   const salt = setting(db, 'tenant_salt')
   if (!salt) throw new Error('relay salt is not initialized')
   return salt
+}
+
+/// A stable public identity for this relay. It survives restarts and database copies, and changes
+/// when the relay's tenant salt changes.
+export function relayId(db: Database): string {
+  return createHash('sha256').update(`perch-relay-id:${relaySalt(db)}`).digest('hex').slice(0, 32)
 }
 
 export function open(path: string, opts: { owner?: string; salt?: string } = {}) {
@@ -302,7 +308,7 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
         return authHandler(req, clientIp(server?.requestIP(req)?.address, req.headers.get('x-real-ip')))
       if (path === '/v1/version') {
         if (req.method !== 'GET') return bad(405, 'GET only')
-        return Response.json({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL })
+        return Response.json({ name: 'perch-relay', version: VERSION, protocol: PROTOCOL, id: relayId(db) })
       }
       if (req.method !== 'POST') return bad(405, 'POST only')
       let body: any
