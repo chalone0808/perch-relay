@@ -125,6 +125,18 @@ test('laptop ↔ phone round trip with routing, dedupe and type rules', async ()
   server.stop(true)
 })
 
+test('a phone registered later does not receive the pre-registration backlog', async () => {
+  const { pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  const old = { id: 'old1', type: 'agent_reply', machine: 'mac', body: { text: 'before this phone' } }
+  await sync(mac, { outbox: [old] })
+  const phone = await pair('phone', 'new-phone') // registered with acked at the current head
+  expect((await sync(phone, { after: 0 })).inbox).toEqual([])
+  const fresh = { id: 'fresh1', type: 'agent_reply', machine: 'mac', body: { text: 'after pairing' } }
+  await sync(mac, { outbox: [fresh] })
+  expect((await sync(phone, { after: 0 })).inbox.map((m: any) => m.id)).toEqual(['fresh1'])
+})
+
 test('laptop prompts and session lifecycle are mirrored to the phone', async () => {
   const { server, pair, sync } = setup()
   const mac = await pair('machine', 'mac')

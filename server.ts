@@ -293,10 +293,13 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
     m && typeof m.id === 'string' && m.id.length <= 64 && allowed.has(m.type) &&
     (m.session_id == null || typeof m.session_id === 'string')
 
+  // A device starts at its own acknowledged position. A freshly registered phone has acked=HEAD
+  // but no local cursor yet, so it asks with after=0; without the floor the relay would send the
+  // whole retained backlog, almost all of it sealed for phones that no longer exist.
   const inboxFor = (dev: any, after: number, tenant: string): Msg[] =>
     (dev.kind === 'machine'
       ? db.query(`select seq, json from messages where tenant_id = ? and dir = 'down' and machine = ? and seq > ? order by seq limit 500`).all(tenant, dev.name, after)
-      : db.query(`select seq, json from messages where tenant_id = ? and dir = 'up' and seq > ? order by seq limit 500`).all(tenant, after)
+      : db.query(`select seq, json from messages where tenant_id = ? and dir = 'up' and seq > ? order by seq limit 500`).all(tenant, Math.max(after, Number(dev.acked) || 0))
     ).map((r: any) => ({ ...JSON.parse(r.json), seq: r.seq }))
 
   return {
