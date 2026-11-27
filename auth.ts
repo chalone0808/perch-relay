@@ -12,6 +12,7 @@
 //   POST /v1/devices/link   Bearer pses_…  { token }         → { token }   a code-paired phone becomes
 //                           a signed-in one: same device row and key, new pdev_ token, old one dead
 //   POST /v1/pair/machine   Bearer pdev_… (a phone)          → { code, expires }
+//   POST /v1/devices/revoke Bearer <phone device token> { name } → {}  (a phone unpairs a computer)
 //   POST /v1/unpair         Bearer <device token>            → {}  (the device revokes itself)
 import type { Database } from 'bun:sqlite'
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto'
@@ -775,6 +776,28 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     return json(200, { code, expires })
   }
 
+  /// A phone unpairs one of its account's computers. The computer's token stops working, it gets
+  /// no more pushes, and its peers stop encrypting for it. A computer can never remove another
+  /// device: it can still only unpair itself.
+  async function revokeMachine(req: Request) {
+    const token = bearer(req)
+    const dev = token && !/^p(ses|auth)_/.test(token)
+      ? (db.query('select id, kind, tenant_id from devices where token_hash = ? and not revoked').get(sha(token)) as any)
+      : null
+    if (!dev) return bad(401, 'unauthorized')
+    if (dev.kind !== 'phone') return bad(403, 'only phones can unpair computers')
+    const name = String((await body(req))?.name ?? '').slice(0, 64)
+    if (!name) return bad(400, 'name required')
+    // Same name across tenants is possible; the phone may only reach its own account's computer.
+    const machine = db.query(
+      `select id from devices where kind = 'machine' and name = ? and tenant_id = ? and not revoked`,
+    ).get(name, dev.tenant_id) as any
+    if (!machine) return bad(404, 'no such computer')
+    db.run('update devices set revoked = 1, push_token = null where id = ?', [machine.id])
+    deps.wake?.(dev.tenant_id)
+    return json(200, {})
+  }
+
   /// Unpairing on a device removes it from the relay too: its token stops working, it gets no more
   /// pushes, and its peers stop encrypting for it. A device can only revoke itself. Any device
   /// token works here (old code-paired ones too); session and handoff credentials never do.
@@ -809,6 +832,7 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     if (route === 'POST /v1/auth/account/rename') return renameAccount(req)
     if (route === 'POST /v1/devices') return registerDevice(req)
     if (route === 'POST /v1/devices/link') return linkDevice(req)
+    if (route === 'POST /v1/devices/revoke') return revokeMachine(req)
     if (route === 'POST /v1/pair/machine') return pairMachine(req)
     if (route === 'POST /v1/unpair') return unpair(req)
     const oauth = req.method === 'GET' && path.match(/^\/v1\/auth\/oauth\/(github|google)\/(start|callback)$/)

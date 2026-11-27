@@ -647,6 +647,32 @@ test('a device that unpairs removes itself from the relay, and only itself', asy
   r.stop()
 })
 
+test('a phone unpairs a computer in its tenant, and no other device', async () => {
+  const r = relay()
+  const pw = await withPassword(r, 'alice', true)
+  const s = await r.session('alice', pw)
+  const phone = ((await (await r.register(s)).json()) as any).token
+  const tenant = relayTenant(r.db)
+  const insert = (name: string, token: string, at: string) =>
+    r.db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id) values ('machine', ?, ?, ?, ?)`, [name, sha(token), KEY, at])
+  insert('mac', 'own-mac-token', tenant)
+  insert('laptop', 'laptop-token', tenant)
+  insert('mac', 'foreign-mac-token', 'another-tenant')
+
+  expect((await r.post('/v1/devices/revoke', { name: 'mac' }, s)).status).toBe(401) // a session is not a phone
+  expect((await r.post('/v1/devices/revoke', { name: 'laptop' }, 'laptop-token')).status).toBe(403) // a computer cannot revoke another
+  expect((await r.post('/v1/devices/revoke', {}, phone)).status).toBe(400)
+  expect((await r.post('/v1/devices/revoke', { name: 'missing' }, phone)).status).toBe(404)
+
+  expect((await r.post('/v1/devices/revoke', { name: 'mac' }, phone)).status).toBe(200)
+  expect(r.db.query(`select revoked from devices where token_hash = ?`).get(sha('own-mac-token'))).toEqual({ revoked: 1 })
+  expect(r.db.query(`select revoked from devices where token_hash = ?`).get(sha('foreign-mac-token'))).toEqual({ revoked: 0 })
+  expect(r.db.query(`select revoked from devices where token_hash = ?`).get(sha('laptop-token'))).toEqual({ revoked: 0 })
+  expect(r.db.query(`select revoked from devices where token_hash = ?`).get(sha(phone))).toEqual({ revoked: 0 })
+  expect((await r.post('/v1/devices/revoke', { name: 'mac' }, phone)).status).toBe(404) // already gone
+  r.stop()
+})
+
 test('a code-paired phone links to its account: same device, new pdev_ token, old token dead', async () => {
   const r = relay()
   const old = legacyPhone(r)

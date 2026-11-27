@@ -209,7 +209,8 @@ A laptop pairs with a single-use code, valid for 10 minutes:
   `perch-relay pair machine <account>` for another account.
 
 Codes are tenant-scoped. `perch-relay devices` lists everything paired;
-`perch-relay revoke <id>` revokes one device.
+`perch-relay revoke <id>` revokes one device. A phone can also unpair a computer
+from **Settings → Computers**, and the computer can run `perch unpair` itself.
 
 ### Run as a service
 

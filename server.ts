@@ -304,7 +304,7 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
     idleTimeout: MAX_WAIT + 10,
     async fetch(req: Request, server?: { requestIP(req: Request): { address: string } | null }) {
       const path = new URL(req.url).pathname
-      if (path.startsWith('/v1/auth/') || path === '/v1/devices' || path === '/v1/devices/link' || path === '/v1/pair/machine' || path === '/v1/unpair')
+      if (path.startsWith('/v1/auth/') || path === '/v1/devices' || path === '/v1/devices/link' || path === '/v1/devices/revoke' || path === '/v1/pair/machine' || path === '/v1/unpair')
         return authHandler(req, clientIp(server?.requestIP(req)?.address, req.headers.get('x-real-ip')))
       if (path === '/v1/version') {
         if (req.method !== 'GET') return bad(405, 'GET only')
