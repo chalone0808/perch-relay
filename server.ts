@@ -38,7 +38,7 @@ import { authConfig, authRoutes, clientIp, type AuthConfig, type AuthDeps } from
 
 // The relay's release version and wire protocol. Bump VERSION for every release; bump PROTOCOL
 // only when a phone or laptop built for the previous protocol can no longer talk to this relay.
-export const VERSION = '0.3.0'
+export const VERSION = '0.3.1'
 export const PROTOCOL = 2
 
 type Msg = {
@@ -47,8 +47,8 @@ type Msg = {
 }
 
 // What each side may send. Anything else is rejected: a phone can't forge agent replies, a laptop can't send prompts.
-const UP = new Set(['session_start', 'session_end', 'agent_reply', 'needs_attention', 'delivered', 'delivery_failed', 'interrupted', 'command_result', 'activity', 'task_note', 'commands', 'compact', 'request_expired', 'decision_result', 'presence', 'user_prompt'])
-const DOWN = new Set(['prompt', 'command', 'decision', 'interrupt', 'presence'])
+const UP = new Set(['session_start', 'session_end', 'agent_reply', 'needs_attention', 'delivered', 'delivery_failed', 'interrupted', 'command_result', 'activity', 'task_note', 'commands', 'compact', 'request_expired', 'decision_result', 'presence', 'user_prompt', 'update_result'])
+const DOWN = new Set(['prompt', 'command', 'decision', 'interrupt', 'presence', 'update'])
 const MAX_WAIT = 30
 // ponytail: a device offline this long loses what was waiting for it; its laptop still has the transcript.
 const UNDELIVERED_TTL = 7 * 24 * 3600 * 1000
@@ -162,6 +162,8 @@ export function open(path: string, opts: { owner?: string; salt?: string } = {})
   // A laptop's reported client version and wire protocol, so phones can show it and flag old ones.
   if (!db.query(`select 1 from pragma_table_info('devices') where name = 'version'`).get()) db.exec('alter table devices add column version text')
   if (!db.query(`select 1 from pragma_table_info('devices') where name = 'protocol'`).get()) db.exec('alter table devices add column protocol integer')
+  // The laptop's latest check of its own update source: { available, latest, checked }.
+  if (!db.query(`select 1 from pragma_table_info('devices') where name = 'client_update'`).get()) db.exec('alter table devices add column client_update text')
   if (!db.query(`select 1 from pragma_table_info('messages') where name = 'created'`).get()) {
     db.exec('alter table messages add column created integer')
     db.run('update messages set created = ?', [Date.now()])
@@ -406,6 +408,15 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
           if (version !== null && version !== dev.version) db.run('update devices set version = ? where id = ?', [version, dev.id])
           const protocol = Number.isInteger(body.protocol) && body.protocol >= 0 && body.protocol <= 1_000_000 ? body.protocol : null
           if (protocol !== null && protocol !== dev.protocol) db.run('update devices set protocol = ? where id = ?', [protocol, dev.id])
+          // The laptop's own check for a newer client; malformed values are ignored.
+          const update = body.update
+          if (update && typeof update === 'object') {
+            const available = update.available === true
+            const latest = typeof update.latest === 'string' && /^[0-9A-Za-z._+-]{1,40}$/.test(update.latest) ? update.latest : null
+            const checked = Number.isFinite(update.checked) ? Math.floor(update.checked) : Date.now()
+            const json = JSON.stringify({ available, latest, checked })
+            if (json !== dev.client_update) db.run('update devices set client_update = ? where id = ?', [json, dev.id])
+          }
         }
         if (dev.kind === 'machine' && body.direct !== undefined) {
           const hint = body.direct === null ? null : directHint(body.direct)
@@ -493,17 +504,23 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
         // `e2e` appears only for devices that read the newer format, so older peers see no change.
         const format = ({ e2e, ...d }: any) => (e2e >= 2 ? { ...d, e2e } : d)
         if (dev.kind === 'phone') {
-          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e, version, protocol, device_id from devices where kind = 'machine' and not revoked and tenant_id = ? order by name`).all(tenant) as any[])
+          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e, version, protocol, device_id, client_update from devices where kind = 'machine' and not revoked and tenant_id = ? order by name`).all(tenant) as any[])
             .map((m) => {
-              // A corrupt stored hint must not break every phone sync; show it as none.
+              // A corrupt stored hint or update check must not break every phone sync.
               let direct = null
               try { direct = m.direct ? JSON.parse(m.direct) : null } catch {}
-              // Version fields appear only once the laptop reported them, so older peers and
-              // frozen compatibility fixtures see the same payload as before.
-              const out: any = format({ ...m, direct })
+              let update = null
+              try { update = m.client_update ? JSON.parse(m.client_update) : null } catch {}
+              const { client_update, ...rest } = m
+              // Version/update fields appear only once the laptop reported them, so older peers
+              // and frozen compatibility fixtures see the same payload as before.
+              const out: any = format({ ...rest, direct, ...(update ? { update } : {}) })
               if (m.version == null) delete out.version
               if (m.protocol == null) delete out.protocol
-              if (!modern) delete out.device_id
+              if (!modern) {
+                delete out.device_id
+                delete out.update
+              }
               return out
             })
         } else {

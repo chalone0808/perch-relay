@@ -685,3 +685,33 @@ test('opening an old relay backfills device ids and rewrites stored machine name
   expect((again.query(`select device_id from devices where token_hash = 'h1'`).get() as any).device_id).toBe(active.device_id)
   again.close()
 })
+
+test('a laptop reports its client update check; only modern phones see it', async () => {
+  const { server, pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  const phone = await pair('phone', 'iphone')
+  await sync(mac, { after: 0, protocol: 2, update: { available: true, latest: 'abc12345', checked: 123 } })
+  let r = await sync(phone, { after: 0, protocol: 2 })
+  expect(r.machines[0].update).toEqual({ available: true, latest: 'abc12345', checked: 123 })
+  // A legacy phone keeps the old machine entry shape.
+  r = await sync(phone, { after: r.cursor })
+  expect(r.machines[0].update).toBeUndefined()
+  server.stop(true)
+})
+
+test('a phone can ask a laptop to update and gets the result', async () => {
+  const { server, pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  const phone = await pair('phone', 'iphone')
+  const ask = { id: 'u1', type: 'update', machine: 'mac', body: {} }
+  let r = await sync(phone, { after: 0, outbox: [ask] })
+  const phoneCursor = r.cursor
+  expect(r.acked).toEqual(['u1'])
+  r = await sync(mac, { after: 0 })
+  const machineCursor = r.cursor
+  expect(r.inbox.map((m: any) => [m.id, m.type])).toEqual([['u1', 'update']])
+  await sync(mac, { after: machineCursor, outbox: [{ id: 'u2', type: 'update_result', session_id: 's1', body: { ref: 'u1', ok: true } }] })
+  r = await sync(phone, { after: phoneCursor })
+  expect(r.inbox.map((m: any) => [m.id, m.type])).toEqual([['u2', 'update_result']])
+  server.stop(true)
+})
