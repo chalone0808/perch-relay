@@ -212,6 +212,12 @@ Codes are tenant-scoped. `perch-relay devices` lists everything paired;
 `perch-relay revoke <id>` revokes one device. A phone can also unpair a computer
 from **Settings → Computers**, and the computer can run `perch unpair` itself.
 
+Every pairing gets its own `dev_…` id. The name is a display label; routing,
+revoke and cursors index the id, so re-pairing under the same name is a
+different device and cannot inherit the old pairing's messages or position.
+Clients that speak protocol 2 send and receive the id; older clients keep the
+name fallback.
+
 ### Run as a service
 
 The installer writes this user unit to
@@ -408,6 +414,10 @@ Never leave Perch files owned by root.
 - Back up the SQLite database, `relay.env`, `push.env`, `account-password.txt`,
   and the APNs `.p8` file. Keep the env, password, and key files at mode 0600.
 - Message bodies are encrypted; the relay sees routing metadata only.
+- Sync cursors are branded with the relay and device id. A cursor from another
+  relay or pairing is rebased to that device's acknowledged position instead of
+  being trusted, so a stale cursor can neither replay a backlog nor stall
+  delivery. The inbox is clamped to each device's `[acked, served]` window.
 - Never expose the relay without TLS. Run it as an unprivileged user and set
   `X-Real-IP` at the proxy.
 - Revoke a lost device with `perch-relay revoke <id>`. Disabling an account also

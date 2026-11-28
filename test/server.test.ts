@@ -525,3 +525,163 @@ test('a v2 preview reaches the phone marked as v2, with no session in the clear'
   expect(calls[0].payload).toMatchObject({ e2e: 2, preview: 'sealed', session_id: null, aps: { 'thread-id': 'mac:' } })
   server.stop(true)
 })
+
+const pairModern = async (post: any, db: Database, name: string, owner?: string) => {
+  const res = await post('/v1/pair', { code: pairCode(db, owner), name, pubkey: randomBytes(32).toString('base64url'), protocol: 2 })
+  return (await res.json()) as { token: string; device_id: string; kind: string }
+}
+
+test('modern clients get a device id and a cursor token; legacy responses stay unchanged', async () => {
+  const { db, server, post, pair, sync } = setup()
+  const mac = await pairModern(post, db, 'mac')
+  expect(mac.device_id).toMatch(/^dev_[0-9a-f]{32}$/)
+  expect(Object.keys(mac).sort()).toEqual(['device_id', 'kind', 'token'])
+  const phone = await pair('phone', 'iphone')
+  let r = await sync(phone, { after: 0, protocol: 2 })
+  expect(r.device_id).toMatch(/^dev_[0-9a-f]{32}$/)
+  expect(r.cursor_token).toBe(`${relayId(db)}:${r.device_id}:${r.cursor}`)
+  expect(r.machines[0].device_id).toBe(mac.device_id)
+  // Without protocol 2 the old shape is exactly what it was (the frozen compat test covers the rest).
+  r = await sync(phone, { after: r.cursor })
+  expect(r.device_id).toBeUndefined()
+  expect(r.cursor_token).toBeUndefined()
+  expect(r.machines[0].device_id).toBeUndefined()
+  server.stop(true)
+})
+
+test('a cursor token acks only its own device and rebases a foreign one', async () => {
+  const { db, server, pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  const phone = await pair('phone', 'one')
+  await sync(mac, { outbox: [{ id: 'u1', type: 'agent_reply', session_id: 's', body: {} }] })
+  const acked = () => (db.query('select acked, served from devices where name = ?').get('one') as any).acked as number
+  const first = await sync(phone, { after: 0, protocol: 2 })
+  expect(first.inbox.map((m: any) => m.id)).toEqual(['u1'])
+  const token = first.cursor_token as string
+  expect(acked()).toBe(0)
+  // A token from another device (here the laptop's) is rebased to this row's acked and never acks.
+  const foreignToken = (await sync(mac, { after: 0, protocol: 2 })).cursor_token as string
+  const foreign = await sync(phone, { after: 1_000_000, cursor_token: foreignToken, protocol: 2 })
+  expect(foreign.inbox.map((m: any) => m.id)).toEqual(['u1'])
+  expect(acked()).toBe(0)
+  expect(db.query(`select count(*) n from messages where id = 'u1'`).get() as any).toMatchObject({ n: 1 })
+  // A malformed token is treated as absent, so the numeric cursor still works.
+  expect((await sync(phone, { after: 0, cursor_token: 'nonsense', protocol: 2 })).inbox.map((m: any) => m.id)).toEqual(['u1'])
+  // Its own token acknowledges the served position and the relay can forget the message.
+  const own = await sync(phone, { after: 0, cursor_token: token, protocol: 2 })
+  expect(own.inbox).toEqual([])
+  expect(acked()).toBe(first.cursor)
+  expect(db.query(`select count(*) n from messages where id = 'u1'`).get() as any).toMatchObject({ n: 0 })
+  server.stop(true)
+})
+
+test('an after beyond what was served cannot suppress delivery', async () => {
+  const { db, server, pair, sync } = setup()
+  const mac = await pair('machine', 'mac')
+  const phone = await pair('phone', 'iphone')
+  await sync(mac, { outbox: [{ id: 'a', type: 'agent_reply', body: {} }] })
+  const first = await sync(phone, { after: 0 })
+  expect(first.inbox.map((m: any) => m.id)).toEqual(['a'])
+  await sync(mac, { outbox: [{ id: 'b', type: 'agent_reply', body: {} }] })
+  const r = await sync(phone, { after: 999 })
+  expect(r.inbox.map((m: any) => m.id)).toEqual(['b'])
+  expect(r.cursor).toBeGreaterThan(first.cursor)
+  // The huge after still acks nothing: it is beyond what this row was served.
+  expect((db.query('select acked from devices where name = ?').get('iphone') as any).acked).toBe(0)
+  server.stop(true)
+})
+
+test('a machine id addresses one pairing; a reused name does not inherit its messages', async () => {
+  const { db, server, post, pair, sync } = setup()
+  const first = await pairModern(post, db, 'mac')
+  const phone = await pair('phone', 'iphone')
+  const machines = (await sync(phone, { after: 0, protocol: 2 })).machines
+  expect(machines).toMatchObject([{ name: 'mac', device_id: first.device_id }])
+  // The phone addresses the exact pairing by id; a wrong display name is ignored.
+  let r = await sync(phone, { after: 0, outbox: [{ id: 'd1', type: 'prompt', machine: 'not-mac', machine_id: first.device_id, body: { text: 'x' } }] })
+  expect(r.acked).toEqual(['d1'])
+  const got = await sync(first.token, { after: 0, protocol: 2 })
+  expect(got.inbox.map((m: any) => m.id)).toEqual(['d1'])
+  expect(got.inbox[0]).toMatchObject({ machine: 'mac', machine_id: first.device_id })
+  // Unpair, then re-pair under the same name: a different device.
+  expect((await post('/v1/devices/revoke', { machine_id: first.device_id }, phone)).status).toBe(200)
+  const second = await pairModern(post, db, 'mac')
+  expect(second.device_id).not.toBe(first.device_id)
+  // A message addressed to the old id is not delivered (and not acked); the live id is.
+  const stale = { id: 'd2', type: 'prompt', machine: 'mac', machine_id: first.device_id, body: { text: 'old' } }
+  const live = { id: 'd3', type: 'prompt', machine: 'mac', machine_id: second.device_id, body: { text: 'new' } }
+  r = await sync(phone, { after: 0, outbox: [stale, live] })
+  expect(r.acked).toEqual(['d3'])
+  const started = await sync(second.token, { after: 0, protocol: 2 })
+  expect(started.inbox.map((m: any) => m.id)).toEqual(['d3'])
+  expect(started.inbox[0]).toMatchObject({ machine: 'mac', machine_id: second.device_id })
+  await sync(second.token, { after: started.cursor, protocol: 2 })
+  // Legacy name addressing still works for old phones.
+  r = await sync(phone, { after: 0, outbox: [{ id: 'd4', type: 'prompt', machine: 'mac', body: { text: 'by name' } }] })
+  expect(r.acked).toEqual(['d4'])
+  expect((await sync(second.token, { after: 0, protocol: 2 })).inbox.map((m: any) => m.id)).toEqual(['d4'])
+  server.stop(true)
+})
+
+test('revoking by a stale machine id never falls back to the name', async () => {
+  const { db, server, post, pair } = setup()
+  const first = await pairModern(post, db, 'mac')
+  const phone = await pair('phone', 'iphone')
+  expect((await post('/v1/devices/revoke', { machine_id: first.device_id }, phone)).status).toBe(200)
+  const second = await pairModern(post, db, 'mac')
+  expect((await post('/v1/devices/revoke', { machine_id: first.device_id, name: 'mac' }, phone)).status).toBe(404)
+  expect((db.query('select revoked from devices where device_id = ?').get(second.device_id) as any).revoked).toBe(0)
+  expect((await post('/v1/devices/revoke', { name: 'mac' }, phone)).status).toBe(200)
+  server.stop(true)
+})
+
+test('a machine id from another tenant cannot be addressed', async () => {
+  const { server, post, db, pair, sync } = setup()
+  const a = await pairModern(post, db, 'mac', 'a@test')
+  const bPhone = await pair('phone', 'p', 'b@test')
+  const r = await sync(bPhone, { after: 0, outbox: [{ id: 'x', type: 'prompt', machine_id: a.device_id, body: {} }] })
+  expect(r.acked).toEqual([])
+  server.stop(true)
+})
+
+test('a modern laptop stamps machine_id on up messages and pushes', async () => {
+  const calls: any[] = []
+  const { server, post, db, pair, sync } = setup(async (_token, payload) => { calls.push(payload); return { status: 200 } })
+  const mac = await pairModern(post, db, 'mac')
+  const phone = await pair('phone', 'iphone')
+  await sync(phone, { after: 0, push_token: 'a'.repeat(64) })
+  await sync(mac.token, { after: 0, protocol: 2, outbox: [{ id: 'r1', type: 'agent_reply', session_id: 's1', body: {}, notify: true }] })
+  expect(calls[0]).toMatchObject({ machine: 'mac', machine_id: mac.device_id })
+  expect((await sync(phone, { after: 0, protocol: 2 })).inbox[0]).toMatchObject({ machine: 'mac', machine_id: mac.device_id })
+  server.stop(true)
+})
+
+test('opening an old relay backfills device ids and rewrites stored machine names', () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'perch-relay-devids-')), 'relay.db')
+  const raw = new Database(path)
+  raw.exec(`
+    create table settings (k text primary key, v text);
+    create table devices (id integer primary key, kind text, name text, token_hash text unique, tenant_id text not null, acked integer not null default 0, revoked integer default 0);
+    create table messages (seq integer primary key autoincrement, id text, machine text, dir text, json text, tenant_id text not null, created integer, unique(tenant_id, id));`)
+  raw.run(`insert into settings (k, v) values ('tenant_salt', ?)`, [SALT])
+  raw.run(`insert into settings (k, v) values ('owner_tenant', 't1')`)
+  raw.run(`insert into devices (kind, name, token_hash, tenant_id, acked) values ('machine', 'mac', 'h1', 't1', 0)`)
+  raw.run(`insert into devices (kind, name, token_hash, tenant_id, acked, revoked) values ('machine', 'mac', 'h2', 't1', 0, 1)`)
+  raw.run(`insert into messages (id, machine, dir, json, tenant_id, created) values ('d1', 'mac', 'down', '{"id":"d1"}', 't1', 0)`)
+  raw.close()
+
+  const db = open(path)
+  const active = db.query(`select device_id from devices where token_hash = 'h1'`).get() as any
+  const revoked = db.query(`select device_id from devices where token_hash = 'h2'`).get() as any
+  expect(active.device_id).toMatch(/^dev_[0-9a-f]{32}$/)
+  expect(revoked.device_id).toMatch(/^dev_[0-9a-f]{32}$/)
+  expect(revoked.device_id).not.toBe(active.device_id)
+  const row = db.query(`select machine, json from messages where id = 'd1'`).get() as any
+  expect(row.machine).toBe(active.device_id) // an active row wins over the revoked one
+  expect(JSON.parse(row.json)).toMatchObject({ id: 'd1', machine_id: active.device_id })
+  db.close()
+
+  const again = open(path)
+  expect((again.query(`select device_id from devices where token_hash = 'h1'`).get() as any).device_id).toBe(active.device_id)
+  again.close()
+})

@@ -59,6 +59,20 @@ export function sweep(db: Database, now = Date.now()) {
 
 export const newToken = (prefix: string, rand: Rand = randomBytes) => prefix + rand(32).toString('base64url')
 
+/// A per-pairing device identity. The device's name stays a display label; this id is what
+/// routing, revoke and cursors index, so re-pairing under the same name is a different device.
+export const newDeviceId = (rand: Rand = randomBytes) => 'dev_' + rand(16).toString('hex')
+
+/// The row's stable identity, minted lazily for rows created before device ids (test fixtures,
+/// legacy linked phones). New pairings and registrations set it at insert.
+export function ensureDeviceId(db: Database, dev: any): string {
+  if (typeof dev?.device_id === 'string' && dev.device_id) return dev.device_id
+  const id = newDeviceId()
+  db.run('update devices set device_id = ? where id = ?', [id, dev.id])
+  dev.device_id = id
+  return id
+}
+
 /// Inserts a fresh token's hash. A unique collision gets exactly one retry; a second one is an
 /// operational error and is thrown, never ignored.
 export function insertWithToken(prefix: string, insert: (hash: string) => void, rand: Rand = randomBytes): string {

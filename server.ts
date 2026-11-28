@@ -13,12 +13,17 @@
 //
 // API (all JSON):
 //   GET  /v1/version                       → { name, version, protocol, id }   public; no auth
-//   POST /v1/pair  { code, name, pubkey }  → { token, kind }   laptops only; phones sign in (auth.ts)
+//   POST /v1/pair  { code, name, pubkey, protocol? }  → { token, kind, device_id? }
+//     laptops only; phones sign in (auth.ts). device_id appears for protocol 2+ clients.
 //   POST /v1/sync  Authorization: Bearer <token>
-//     body { after, outbox: Msg[], wait, pubkey }  → { acked, inbox: Msg[], cursor, machines? | phones? }
+//     body { after, cursor_token?, protocol?, outbox: Msg[], wait, pubkey }
+//       → { acked, inbox: Msg[], cursor, cursor_token?, device_id?, machines? | phones? }
 //     bodies are end-to-end encrypted (client/e2e.ts); machines/phones carry the peers' public keys
 //     machines push up-messages and receive down-messages addressed to them;
-//     phones push down-messages (each with `machine`) and receive every up-message.
+//     phones push down-messages (each with `machine` and, when known, `machine_id`) and receive
+//     every up-message. The relay normalizes both routing fields from its own device table.
+//     `cursor_token` is "<relay id>:<device id>:<seq>"; a token from another relay or pairing is
+//     rebased to that row's acknowledged position and never acks anything.
 //   Sign-in, self-registration and phone-issued laptop codes: see auth.ts.
 //
 // ponytail: plain HTTP. Put it behind Tailscale or a TLS proxy (Caddy); never expose it bare.
@@ -28,16 +33,16 @@ import { Database } from 'bun:sqlite'
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { isIPv4 } from 'node:net'
 import { makePushSender, type PushSender } from './apns'
-import { accountCli, authSchema, HEAD, inviteCli, sha, sweep } from './accounts'
+import { accountCli, authSchema, ensureDeviceId, HEAD, inviteCli, newDeviceId, sha, sweep } from './accounts'
 import { authConfig, authRoutes, clientIp, type AuthConfig, type AuthDeps } from './auth'
 
 // The relay's release version and wire protocol. Bump VERSION for every release; bump PROTOCOL
 // only when a phone or laptop built for the previous protocol can no longer talk to this relay.
-export const VERSION = '0.2.0'
-export const PROTOCOL = 1
+export const VERSION = '0.3.0'
+export const PROTOCOL = 2
 
 type Msg = {
-  id: string; type: string; session_id?: string | null; machine?: string; body?: unknown; ts?: string
+  id: string; type: string; session_id?: string | null; machine?: string; machine_id?: string; body?: unknown; ts?: string
   notify?: boolean; snapshot?: boolean; to?: string[]
 }
 
@@ -109,6 +114,19 @@ export function relaySalt(db: Database): string {
 export function relayId(db: Database): string {
   return createHash('sha256').update(`perch-relay-id:${relaySalt(db)}`).digest('hex').slice(0, 32)
 }
+
+/// A cursor is only meaningful for the relay and device row that issued it. A token from either
+/// somewhere else is rebased rather than trusted; a malformed token is treated as absent.
+export function parseCursorToken(token: unknown, relay: string, device: string): { seq: number } | 'foreign' | null {
+  if (typeof token !== 'string') return null
+  const m = /^([0-9a-f]{32}):(dev_[0-9a-f]{32}):(\d{1,16})$/.exec(token)
+  if (!m) return null
+  if (m[1] !== relay || m[2] !== device) return 'foreign'
+  const seq = Number(m[3])
+  return Number.isSafeInteger(seq) ? { seq } : null
+}
+
+export const cursorToken = (relay: string, device: string, seq: number) => `${relay}:${device}:${seq}`
 
 export function open(path: string, opts: { owner?: string; salt?: string } = {}) {
   const db = new Database(path)
@@ -201,6 +219,30 @@ export function open(path: string, opts: { owner?: string; salt?: string } = {})
   db.exec(`
     create index if not exists messages_tenant_seq on messages (tenant_id, dir, seq);
     create index if not exists messages_tenant_machine_seq on messages (tenant_id, dir, machine, seq);`)
+  // A per-pairing identity. The name stays a display label; routing, revoke and cursors index this
+  // id, so a re-pair under the same name is a different device. Backfill old rows once, then
+  // rewrite stored messages from names to ids.
+  if (!db.query(`select 1 from pragma_table_info('devices') where name = 'device_id'`).get()) db.exec('alter table devices add column device_id text')
+  if (!setting(db, 'device_ids_v1')) {
+    db.transaction(() => {
+      for (const row of db.query('select id from devices where device_id is null or device_id = ?').all('') as { id: number }[]) {
+        db.run('update devices set device_id = ? where id = ?', [newDeviceId(), row.id])
+      }
+      db.exec('create unique index if not exists devices_tenant_device on devices (tenant_id, device_id)')
+      // Resolve a stored machine name to the row that would receive it today: an active row first,
+      // then the newest revoked one. Names with no row are left alone.
+      const resolve = db.query(`select device_id from devices where tenant_id = ? and kind = 'machine' and name = ? order by revoked asc, id desc limit 1`)
+      for (const m of db.query('select seq, tenant_id, machine, json from messages').all() as any[]) {
+        if (typeof m.machine !== 'string' || !m.machine || m.machine.startsWith('dev_')) continue
+        const hit = resolve.get(m.tenant_id, m.machine) as { device_id: string } | null
+        if (!hit?.device_id) continue
+        let json = m.json
+        try { json = JSON.stringify({ ...JSON.parse(m.json), machine_id: hit.device_id }) } catch {}
+        db.run('update messages set machine = ?, json = ? where seq = ?', [hit.device_id, json, m.seq])
+      }
+      db.run(`insert into settings (k, v) values ('device_ids_v1', '1')`)
+    })()
+  }
   return db
 }
 
@@ -227,6 +269,7 @@ export function pushPayload(m: Msg) {
   return {
     aps: { alert, sound: 'default', 'thread-id': thread },
     type: m.type, session_id: m.session_id ?? null, machine: m.machine ?? null,
+    ...(m.machine_id ? { machine_id: m.machine_id } : {}),
   }
 }
 
@@ -254,16 +297,16 @@ function pushAlert(m: Msg): { title: string; body: string } | null {
 }
 
 export function app(db: Database, push?: PushSender, auth: AuthConfig = authConfig({}), authDeps: AuthDeps = {}) {
-  type Waiter = { tenant: string; kind: string; name: string; done: () => void }
+  type Waiter = { tenant: string; kind: string; deviceId: string; done: () => void }
   const waiting = new Set<Waiter>()
   // Wake only the devices whose next sync can see the change: phones for a message from a laptop,
   // the addressed laptop for a message from a phone, and a whole tenant when its device list
   // changed (a newly paired phone needs the laptop's live snapshot right away).
-  const wake = (tenant: string, dir?: 'up' | 'down', machine?: string) => {
+  const wake = (tenant: string, dir?: 'up' | 'down', deviceId?: string) => {
     for (const w of [...waiting]) {
       if (w.tenant !== tenant) continue
       if (dir === 'up' && w.kind !== 'phone') continue
-      if (dir === 'down' && (w.kind !== 'machine' || (machine != null && w.name !== machine))) continue
+      if (dir === 'down' && (w.kind !== 'machine' || (deviceId != null && w.deviceId !== deviceId))) continue
       w.done()
     }
   }
@@ -293,13 +336,13 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
     m && typeof m.id === 'string' && m.id.length <= 64 && allowed.has(m.type) &&
     (m.session_id == null || typeof m.session_id === 'string')
 
-  // A device starts at its own acknowledged position. A freshly registered phone has acked=HEAD
-  // but no local cursor yet, so it asks with after=0; without the floor the relay would send the
-  // whole retained backlog, almost all of it sealed for phones that no longer exist.
+  // The caller clamps `after` to the device's own [acked, served] window: a fresh device starts at
+  // its acknowledged position instead of replaying the retained backlog, and a cursor from ahead
+  // of what this row was served can't suppress delivery.
   const inboxFor = (dev: any, after: number, tenant: string): Msg[] =>
     (dev.kind === 'machine'
-      ? db.query(`select seq, json from messages where tenant_id = ? and dir = 'down' and machine = ? and seq > ? order by seq limit 500`).all(tenant, dev.name, after)
-      : db.query(`select seq, json from messages where tenant_id = ? and dir = 'up' and seq > ? order by seq limit 500`).all(tenant, Math.max(after, Number(dev.acked) || 0))
+      ? db.query(`select seq, json from messages where tenant_id = ? and dir = 'down' and machine = ? and seq > ? order by seq limit 500`).all(tenant, dev.device_id, after)
+      : db.query(`select seq, json from messages where tenant_id = ? and dir = 'up' and seq > ? order by seq limit 500`).all(tenant, after)
     ).map((r: any) => ({ ...JSON.parse(r.json), seq: r.seq }))
 
   return {
@@ -332,9 +375,12 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
         if ((db.query(`select count(*) as n from devices where kind = 'machine' and tenant_id = ? and not revoked`).get(tenant) as any).n >= 20)
           return bad(409, 'too many machines; revoke one with `perch revoke`')
         const token = randomBytes(32).toString('base64url')
-        db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id, acked, served) values ('machine', ?, ?, ?, ?, (${HEAD}), (${HEAD}))`, [name, sha(token), pubkey(body.pubkey), tenant])
+        const deviceId = newDeviceId()
+        db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id, acked, served, device_id) values ('machine', ?, ?, ?, ?, (${HEAD}), (${HEAD}), ?)`, [name, sha(token), pubkey(body.pubkey), tenant, deviceId])
         wake(tenant) // e.g. a laptop learns about a new phone now, not on its next 25s poll
-        return Response.json({ token, kind: 'machine' })
+        // The id is a new wire field: only clients that asked for the new protocol see it, so the
+        // frozen pre-accounts pair body keeps its exact shape.
+        return Response.json({ token, kind: 'machine', ...(Number(body.protocol) >= 2 ? { device_id: deviceId } : {}) })
       }
 
       if (path === '/v1/sync') {
@@ -368,54 +414,86 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
         }
 
         const tenant = dev.tenant_id || relayTenant(db)
+        const device = ensureDeviceId(db, dev)
+        const relay = relayId(db)
+        // New wire fields are capability-gated so old clients (and the frozen compatibility
+        // fixtures) keep their exact response shape.
+        const modern = Number(body.protocol) >= 2
         const outbox: any[] = Array.isArray(body.outbox) ? body.outbox.slice(0, 500) : []
         const acked: string[] = []
+        // A phone addresses one exact pairing. An id that does not resolve is dropped, never
+        // retried by the name: a re-paired machine under the same name must not inherit messages.
+        const targetById = db.query(`select device_id, name from devices where kind = 'machine' and device_id = ? and tenant_id = ? and not revoked`)
+        const targetByName = db.query(`select device_id, name from devices where kind = 'machine' and name = ? and tenant_id = ? and not revoked`)
         for (const m of outbox) {
           if (dev.kind === 'machine') {
             if (!valid(m, UP)) continue
-            const stored = { ...m, machine: dev.name }
-            const fresh = db.run(`insert or ignore into messages (id, machine, dir, json, tenant_id, created) values (?, ?, 'up', ?, ?, ?)`, [m.id, dev.name, JSON.stringify(stored), tenant, Date.now()]).changes
+            const stored = { ...m, machine: dev.name, ...(modern ? { machine_id: device } : {}) }
+            const fresh = db.run(`insert or ignore into messages (id, machine, dir, json, tenant_id, created) values (?, ?, 'up', ?, ?, ?)`, [m.id, device, JSON.stringify(stored), tenant, Date.now()]).changes
             if (fresh) {
               notifyPhones(stored, tenant)
               wake(tenant, 'up')
             }
           } else {
-            if (!valid(m, DOWN) || typeof m.machine !== 'string') continue
-            // A phone may only address a machine that belongs to its own tenant.
-            if (!db.query(`select 1 from devices where kind = 'machine' and name = ? and tenant_id = ? and not revoked`).get(m.machine, tenant)) continue
-            const fresh = db.run(`insert or ignore into messages (id, machine, dir, json, tenant_id, created) values (?, ?, 'down', ?, ?, ?)`, [m.id, m.machine, JSON.stringify(m), tenant, Date.now()]).changes
-            if (fresh) wake(tenant, 'down', m.machine)
+            if (!valid(m, DOWN)) continue
+            let target: { device_id: string; name: string } | null = null
+            if (m.machine_id != null) {
+              if (typeof m.machine_id !== 'string') continue
+              target = targetById.get(m.machine_id, tenant) as any
+            } else if (typeof m.machine === 'string') {
+              target = targetByName.get(m.machine, tenant) as any
+            }
+            if (!target) continue
+            const stored = { ...m, machine: target.name, machine_id: target.device_id }
+            const fresh = db.run(`insert or ignore into messages (id, machine, dir, json, tenant_id, created) values (?, ?, 'down', ?, ?, ?)`, [m.id, target.device_id, JSON.stringify(stored), tenant, Date.now()]).changes
+            if (fresh) wake(tenant, 'down', target.device_id)
           }
           acked.push(m.id) // duplicates are acked too: the sender can forget them
         }
 
-        const after = Number(body.after) || 0
-        if (after > dev.acked && after <= dev.served) {
+        // A cursor token from this relay and this device row is authoritative. A token from
+        // somewhere else is rebased to the row's acknowledged position and never acks anything;
+        // a malformed or absent token falls back to the legacy numeric `after`.
+        const ackedBefore = Number(dev.acked) || 0
+        const servedBefore = Number(dev.served) || 0
+        const rawAfter = Number(body.after) || 0
+        const cursorTok = parseCursorToken(body.cursor_token, relay, device)
+        const trusted = cursorTok !== 'foreign'
+        const after = cursorTok && cursorTok !== 'foreign' ? cursorTok.seq : rawAfter
+        if (trusted && after > ackedBefore && after <= servedBefore) {
           db.run('update devices set acked = ? where id = ?', [after, dev.id])
-          if (dev.kind === 'machine') db.run(`delete from messages where tenant_id = ? and dir = 'down' and machine = ? and seq <= ?`, [tenant, dev.name, after])
+          if (dev.kind === 'machine') db.run(`delete from messages where tenant_id = ? and dir = 'down' and machine = ? and seq <= ?`, [tenant, device, after])
           else db.run(`delete from messages where tenant_id = ? and dir = 'up' and seq <= (select min(acked) from devices where tenant_id = ? and kind = 'phone' and not revoked)`, [tenant, tenant])
           db.run('delete from messages where created < ?', [Date.now() - UNDELIVERED_TTL])
         }
-        let inbox = inboxFor(dev, after, tenant)
+        // Both kinds start inside their own acknowledged/served window: a fresh device doesn't
+        // replay the retained backlog, and a cursor from ahead of what this row was served can't
+        // suppress delivery.
+        const start = Math.max(ackedBefore, Math.min(cursorTok === 'foreign' ? ackedBefore : after, servedBefore))
+        let inbox = inboxFor(dev, start, tenant)
         const wait = Math.min(Number(body.wait) || 0, MAX_WAIT)
         if (!inbox.length && wait > 0) {
           await new Promise<void>((resolve) => {
-            const waiter: Waiter = { tenant, kind: dev.kind, name: dev.name, done: () => {} }
+            const waiter: Waiter = { tenant, kind: dev.kind, deviceId: device, done: () => {} }
             const done = () => { clearTimeout(timer); waiting.delete(waiter); resolve() }
             const timer = setTimeout(done, wait * 1000)
             waiter.done = done
             waiting.add(waiter)
             req.signal.addEventListener('abort', done)
           })
-          inbox = inboxFor(dev, after, tenant)
+          inbox = inboxFor(dev, start, tenant)
         }
-        const cursor = inbox.length ? inbox[inbox.length - 1].seq! : after
-        if (inbox.length && cursor > dev.served) db.run('update devices set served = ? where id = ?', [cursor, dev.id])
+        const cursor = inbox.length ? inbox[inbox.length - 1].seq! : start
+        if (inbox.length && cursor > servedBefore) db.run('update devices set served = ? where id = ?', [cursor, dev.id])
         const res: any = { acked, inbox, cursor }
+        if (modern) {
+          res.device_id = device
+          res.cursor_token = cursorToken(relay, device, cursor)
+        }
         // `e2e` appears only for devices that read the newer format, so older peers see no change.
         const format = ({ e2e, ...d }: any) => (e2e >= 2 ? { ...d, e2e } : d)
         if (dev.kind === 'phone') {
-          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e, version, protocol from devices where kind = 'machine' and not revoked and tenant_id = ?`).all(tenant) as any[])
+          res.machines = (db.query(`select name, last_seen, pubkey, direct, e2e, version, protocol, device_id from devices where kind = 'machine' and not revoked and tenant_id = ? order by name`).all(tenant) as any[])
             .map((m) => {
               // A corrupt stored hint must not break every phone sync; show it as none.
               let direct = null
@@ -425,10 +503,17 @@ export function app(db: Database, push?: PushSender, auth: AuthConfig = authConf
               const out: any = format({ ...m, direct })
               if (m.version == null) delete out.version
               if (m.protocol == null) delete out.protocol
+              if (!modern) delete out.device_id
+              return out
+            })
+        } else {
+          res.phones = (db.query(`select name, pubkey, e2e, device_id from devices where kind = 'phone' and not revoked and tenant_id = ? order by name`).all(tenant) as any[])
+            .map((p) => {
+              const out: any = format(p)
+              if (!modern) delete out.device_id
               return out
             })
         }
-        else res.phones = (db.query(`select name, pubkey, e2e from devices where kind = 'phone' and not revoked and tenant_id = ?`).all(tenant) as any[]).map(format)
         return Response.json(res)
       }
       return bad(404, 'not found')
@@ -446,7 +531,7 @@ if (import.meta.main) {
   } else if (cmd === 'tenant') {
     console.log(relayTenant(db))
   } else if (cmd === 'devices') {
-    console.table(db.query('select id, kind, name, tenant_id, last_seen, version, protocol, revoked, pubkey is not null as encrypted from devices').all())
+    console.table(db.query('select id, kind, name, device_id, tenant_id, last_seen, version, protocol, revoked, pubkey is not null as encrypted from devices').all())
   } else if (cmd === 'account') {
     try {
       console.log(await accountCli(db, process.argv.slice(3)))

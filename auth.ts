@@ -8,16 +8,17 @@
 //   POST /v1/auth/exchange  { code, verifier }     → { session }   (handoff from a browser flow)
 //   POST /v1/auth/email/start { email, challenge } → 202 {}; GET …/email/verify; POST …/email/consume
 //   GET  /v1/auth/oauth/:provider/start?challenge=…  → provider → …/callback → perch://auth/callback
-//   POST /v1/devices        Bearer pses_…  { name, pubkey } → { token, kind: 'phone' }
-//   POST /v1/devices/link   Bearer pses_…  { token }         → { token }   a code-paired phone becomes
-//                           a signed-in one: same device row and key, new pdev_ token, old one dead
+//   POST /v1/devices        Bearer pses_…  { name, pubkey } → { token, kind: 'phone', device_id }
+//   POST /v1/devices/link   Bearer pses_…  { token }         → { token, device_id }   a code-paired
+//                           phone becomes a signed-in one: same row/key, new pdev_ token, old dead
 //   POST /v1/pair/machine   Bearer pdev_… (a phone)          → { code, expires }
-//   POST /v1/devices/revoke Bearer <phone device token> { name } → {}  (a phone unpairs a computer)
+//   POST /v1/devices/revoke Bearer <phone device token> { machine_id?, name? } → {}
+//                           (a phone unpairs a computer; the exact id wins over the name)
 //   POST /v1/unpair         Bearer <device token>            → {}  (the device revokes itself)
 import type { Database } from 'bun:sqlite'
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from 'node:crypto'
 import { isIP } from 'node:net'
-import { canonicalName, ClaimError, HEAD, hashPassword, insertClaimedAccount, insertWithToken, sha, sweep, verifyPassword, type Rand } from './accounts'
+import { canonicalName, ClaimError, ensureDeviceId, HEAD, hashPassword, insertClaimedAccount, insertWithToken, newDeviceId, sha, sweep, verifyPassword, type Rand } from './accounts'
 import { smtpSender, type SendMail } from './smtp'
 
 const SESSION_MS = 60 * 60_000
@@ -398,11 +399,12 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     const b = await body(req)
     const old = typeof b?.token === 'string' ? b.token : ''
     if (/^p(dev|ses|auth)_/.test(old)) return bad(400, 'this phone is already signed in')
-    const dev = old ? (db.query(`select id, kind, tenant_id from devices where token_hash = ? and not revoked`).get(sha(old)) as any) : null
+    const dev = old ? (db.query(`select id, kind, tenant_id, device_id from devices where token_hash = ? and not revoked`).get(sha(old)) as any) : null
     // Unknown, revoked, a laptop, or another tenant's device: one answer for all of them.
     if (!dev || dev.kind !== 'phone' || dev.tenant_id !== account.tenant_id) return bad(403, 'this phone is not in your account')
     const token = insertWithToken('pdev_', (hash) => db.run('update devices set token_hash = ? where id = ?', [hash, dev.id]), rand)
-    return json(200, { token, account_id: account.id })
+    // Linking keeps the same row; a code-paired phone gets its id lazily here.
+    return json(200, { token, account_id: account.id, device_id: ensureDeviceId(db, dev) })
   }
 
   async function registerDevice(req: Request) {
@@ -418,10 +420,12 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
     if (!key) return bad(400, 'pubkey required')
     const phones = (db.query(`select count(*) as n from devices where kind = 'phone' and not revoked and tenant_id = ?`).get(account.tenant_id) as any).n
     if (phones >= 10) return bad(409, 'too many phones; revoke one with `perch revoke`')
+    const deviceId = newDeviceId()
     const token = insertWithToken('pdev_', (hash) =>
-      db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id, acked, served) values ('phone', ?, ?, ?, ?, (${HEAD}), (${HEAD}))`, [name, hash, key, account.tenant_id]), rand)
+      db.run(`insert into devices (kind, name, token_hash, pubkey, tenant_id, acked, served, device_id) values ('phone', ?, ?, ?, ?, (${HEAD}), (${HEAD}), ?)`, [name, hash, key, account.tenant_id, deviceId]), rand)
     deps.wake?.(account.tenant_id)
-    return json(200, { token, kind: 'phone', account_id: account.id })
+    // Every registration is its own device, even when the phone name is reused.
+    return json(200, { token, kind: 'phone', account_id: account.id, device_id: deviceId })
   }
 
   /// The account an email address may sign in to: bound, and enabled.
@@ -786,12 +790,16 @@ export function authRoutes(db: Database, cfg: AuthConfig, deps: AuthDeps = {}) {
       : null
     if (!dev) return bad(401, 'unauthorized')
     if (dev.kind !== 'phone') return bad(403, 'only phones can unpair computers')
-    const name = String((await body(req))?.name ?? '').slice(0, 64)
-    if (!name) return bad(400, 'name required')
+    const b = await body(req)
+    const id = typeof b?.machine_id === 'string' ? b.machine_id : null
+    const name = String(b?.name ?? '').slice(0, 64)
+    if (id === null && !name) return bad(400, 'name required')
     // Same name across tenants is possible; the phone may only reach its own account's computer.
-    const machine = db.query(
-      `select id from devices where kind = 'machine' and name = ? and tenant_id = ? and not revoked`,
-    ).get(name, dev.tenant_id) as any
+    // An id is exact and never falls back to the name: a stale row must not revoke a re-paired
+    // machine that reused the name.
+    const machine = id === null
+      ? db.query(`select id from devices where kind = 'machine' and name = ? and tenant_id = ? and not revoked`).get(name, dev.tenant_id) as any
+      : db.query(`select id from devices where kind = 'machine' and device_id = ? and tenant_id = ? and not revoked`).get(id, dev.tenant_id) as any
     if (!machine) return bad(404, 'no such computer')
     db.run('update devices set revoked = 1, push_token = null where id = ?', [machine.id])
     deps.wake?.(dev.tenant_id)

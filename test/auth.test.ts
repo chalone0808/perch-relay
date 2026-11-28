@@ -124,11 +124,16 @@ test('registration makes a pdev_ phone in the account tenant; tokens stay in the
   const s = await r.session('alice', pw)
   expect((await r.post('/v1/sync', { after: 0 }, s)).status).toBe(401) // a session is not a device
   const res = await r.register(s)
-  const { token, kind } = (await res.json()) as any
+  const { token, kind, device_id } = (await res.json()) as any
   expect(kind).toBe('phone')
   expect(token).toMatch(/^pdev_[A-Za-z0-9_-]{43}$/)
-  const dev = r.db.query('select tenant_id, pubkey, token_hash from devices').get() as any
+  expect(device_id).toMatch(/^dev_[0-9a-f]{32}$/)
+  const dev = r.db.query('select tenant_id, pubkey, token_hash from devices where token_hash = ?').get(sha(token)) as any
   expect(dev).toEqual({ tenant_id: relayTenant(r.db), pubkey: KEY, token_hash: sha(token) })
+  expect(r.db.query('select device_id from devices where token_hash = ?').get(sha(token))).toEqual({ device_id })
+  // The same phone name is another device: ids come from the pairing, not the label.
+  const again = (await (await r.register(s)).json()) as any
+  expect(again.device_id).not.toBe(device_id)
   expect((await r.post('/v1/sync', { after: 0 }, token)).status).toBe(200)
   expect((await r.register(token)).status).toBe(401) // a device token can't register devices
   expect((await r.post('/v1/devices', { name: 'x' }, s)).status).toBe(400) // pubkey required
@@ -682,9 +687,11 @@ test('a code-paired phone links to its account: same device, new pdev_ token, ol
 
   const res = await r.post('/v1/devices/link', { token: old }, s)
   expect(res.status).toBe(200)
-  const { token } = (await res.json()) as any
+  const { token, device_id } = (await res.json()) as any
   expect(token).toMatch(/^pdev_/)
+  expect(device_id).toMatch(/^dev_[0-9a-f]{32}$/)
   expect(r.db.query(`select id, pubkey, acked from devices where token_hash = ?`).get(sha(token))).toEqual(before)
+  expect(r.db.query(`select device_id from devices where token_hash = ?`).get(sha(token))).toEqual({ device_id })
   expect((await r.post('/v1/sync', { after: 0 }, old)).status).toBe(401)
   expect((await r.post('/v1/sync', { after: 0 }, token)).status).toBe(200)
   expect((await r.post('/v1/pair/machine', {}, token)).status).toBe(200) // Add a Laptop works now
